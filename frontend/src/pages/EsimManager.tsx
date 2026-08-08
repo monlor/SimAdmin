@@ -561,9 +561,11 @@ function InfoCell({
 
 export default function EsimManagerPage() {
   const initialSnapshot = esimPageSnapshot
-  const [euicc, setEuicc] = useState<EsimEuiccInfo | null>(initialSnapshot?.euicc ?? null)
-  const [profiles, setProfiles] = useState<EsimProfile[]>(initialSnapshot?.profiles ?? [])
-  const [selectedIccid, setSelectedIccid] = useState<string>(initialSnapshot?.selectedIccid ?? '')
+  // A cached view can describe a card that has since been replaced. Wait for
+  // the live EID check instead of briefly rendering that card's data.
+  const [euicc, setEuicc] = useState<EsimEuiccInfo | null>(null)
+  const [profiles, setProfiles] = useState<EsimProfile[]>([])
+  const [selectedIccid, setSelectedIccid] = useState<string>('')
   const [statusLoading, setStatusLoading] = useState(!initialSnapshot?.lpacStatus)
   const [profilesLoading, setProfilesLoading] = useState(false)
   const [euiccLoading, setEuiccLoading] = useState(false)
@@ -822,26 +824,9 @@ export default function EsimManagerPage() {
     }
 
     try {
-      let hasProfiles = profiles.length > 0
-
-      if (!forceLive) {
-        setProfilesLoading(true)
-        const cachedProfilesRes = await requestOrNull(api.getCachedEsimProfiles(), 'profiles-cache', false)
-        const cachedProfiles = cachedProfilesRes?.data?.profiles ?? []
-        if (cachedProfiles.length > 0) {
-          hasProfiles = true
-          setProfiles(cachedProfiles)
-          setSelectedIccid((current) => {
-            const nextSelectedIccid = preferredProfileIccid(cachedProfiles, current)
-            updateEsimPageSnapshot({
-              profiles: cachedProfiles,
-              selectedIccid: nextSelectedIccid,
-            })
-            return nextSelectedIccid
-          })
-        }
-        setProfilesLoading(false)
-      }
+      // Do not trust the previous render's profiles: the physical eUICC may
+      // have been replaced while this page was closed.
+      let hasProfiles = false
 
       const statusRes = await requestOrNull(api.getEsimLpacStatus(), 'lpac')
       setStatusLoading(false)
@@ -865,6 +850,36 @@ export default function EsimManagerPage() {
         return
       }
 
+      // A live EID check lets the backend invalidate the profile cache when a
+      // different physical eUICC is inserted. Only then may this page use the
+      // fast cached profile list.
+      setEuiccLoading(true)
+      const euiccRes = await requestOrNull(api.getEsimEuicc(true), 'euicc')
+      setEuiccLoading(false)
+      if (euiccRes?.data) {
+        setEuicc(euiccRes.data)
+        updateEsimPageSnapshot({ euicc: euiccRes.data })
+      }
+
+      if (!forceLive && euiccRes?.data?.eid?.trim()) {
+        setProfilesLoading(true)
+        const cachedProfilesRes = await requestOrNull(api.getCachedEsimProfiles(), 'profiles-cache', false)
+        const cachedProfiles = cachedProfilesRes?.data?.profiles ?? []
+        if (cachedProfiles.length > 0) {
+          hasProfiles = true
+          setProfiles(cachedProfiles)
+          setSelectedIccid((current) => {
+            const nextSelectedIccid = preferredProfileIccid(cachedProfiles, current)
+            updateEsimPageSnapshot({
+              profiles: cachedProfiles,
+              selectedIccid: nextSelectedIccid,
+            })
+            return nextSelectedIccid
+          })
+        }
+        setProfilesLoading(false)
+      }
+
       const shouldLoadLiveProfiles = forceLive || !hasProfiles
       if (shouldLoadLiveProfiles) {
         setProfilesLoading(true)
@@ -882,14 +897,6 @@ export default function EsimManagerPage() {
             return nextSelectedIccid
           })
         }
-      }
-
-      setEuiccLoading(true)
-      const euiccRes = await requestOrNull(api.getEsimEuicc(forceLive), 'euicc')
-      setEuiccLoading(false)
-      if (euiccRes?.data) {
-        setEuicc(euiccRes.data)
-        updateEsimPageSnapshot({ euicc: euiccRes.data })
       }
 
       if (failures.length > 0) {
@@ -1006,17 +1013,17 @@ export default function EsimManagerPage() {
       const response = confirmAction === 'enable'
         ? await api.enableEsimProfile(selectedProfile.iccid)
         : await api.deleteEsimProfile(selectedProfile.iccid)
+      const action = confirmAction
       if (!commandSucceeded(response.data)) {
         throw new Error(response.data?.msg || 'eSIM 操作失败')
       }
-      const action = confirmAction
       const targetIccid = selectedProfile.iccid
       setConfirmAction(null)
       setDeleteConfirmText('')
       if (action === 'enable') {
-        // Profile enable succeeded (lpac command done), baseband recovery runs in background.
-        // Immediately update the UI optimistically and open the recovery progress dialog.
-        setSuccess('Profile 启用指令成功，基带正在恢复...')
+        // The Profile command is complete; only the baseband restart and
+        // network-registration recovery continue in the background.
+        setSuccess('Profile 已切换，基带正在恢复…')
         setSelectedIccid(targetIccid)
         updateEsimPageSnapshot({ selectedIccid: targetIccid })
         setProfiles((current) => {
