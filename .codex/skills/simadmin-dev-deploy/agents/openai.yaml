@@ -1,0 +1,4 @@
+interface:
+  display_name: "SimAdmin 开发部署"
+  short_description: "Build and deploy SimAdmin to the NAS development server"
+  default_prompt: "Use $simadmin-dev-deploy to deploy the current SimAdmin branch to the development NAS."
