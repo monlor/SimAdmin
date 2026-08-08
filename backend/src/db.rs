@@ -5,6 +5,7 @@
 use chrono::{DateTime, Duration, FixedOffset, NaiveDateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Result, Row};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -1821,6 +1822,37 @@ impl Database {
         Ok(())
     }
 
+    /// Removes cached profiles that were absent from a successful live eUICC
+    /// profile listing. The cache must not resurrect profiles that were
+    /// deleted from, or no longer belong to, the current eUICC.
+    pub fn prune_esim_profile_cache(&self, live_iccids: &[String]) -> Result<usize> {
+        let live_iccids = live_iccids
+            .iter()
+            .map(|iccid| crate::utils::normalize_iccid(iccid))
+            .filter(|iccid| !iccid.is_empty())
+            .collect::<HashSet<_>>();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let cached_iccids = {
+            let mut statement = tx.prepare("SELECT iccid FROM esim_profile_cache")?;
+            let cached_iccids = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>>>()?;
+            cached_iccids
+        };
+        let mut deleted = 0;
+        for iccid in cached_iccids {
+            if !live_iccids.contains(&iccid) {
+                deleted += tx.execute(
+                    "DELETE FROM esim_profile_cache WHERE iccid = ?1",
+                    params![iccid],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(deleted)
+    }
+
     /// Profiles belong to the physical eUICC that reported them.  When that
     /// card changes, the old profile list must never be used as a fast cache
     /// for the replacement card.
@@ -2307,6 +2339,31 @@ mod tests {
         assert_eq!(listed[0].delete_allowed, Some(true));
 
         db.clear_esim_profile_cache().unwrap();
+        assert!(db.list_esim_profile_cache().unwrap().is_empty());
+    }
+
+    #[test]
+    fn esim_profile_cache_prunes_profiles_absent_from_live_listing() {
+        let db = test_db();
+        for iccid in ["8901000000000000001", "8901000000000000002"] {
+            db.upsert_esim_profile_cache(&EsimProfileCacheEntry {
+                iccid: iccid.to_string(),
+                name: Some(format!("Profile {iccid}")),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+
+        assert_eq!(
+            db.prune_esim_profile_cache(&["8901000000000000001".to_string()])
+                .unwrap(),
+            1
+        );
+        let listed = db.list_esim_profile_cache().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].iccid, "8901000000000000001");
+
+        assert_eq!(db.prune_esim_profile_cache(&[]).unwrap(), 1);
         assert!(db.list_esim_profile_cache().unwrap().is_empty());
     }
 

@@ -824,10 +824,6 @@ export default function EsimManagerPage() {
     }
 
     try {
-      // Do not trust the previous render's profiles: the physical eUICC may
-      // have been replaced while this page was closed.
-      let hasProfiles = false
-
       const statusRes = await requestOrNull(api.getEsimLpacStatus(), 'lpac')
       setStatusLoading(false)
       if (!statusRes?.data) {
@@ -866,7 +862,6 @@ export default function EsimManagerPage() {
         const cachedProfilesRes = await requestOrNull(api.getCachedEsimProfiles(), 'profiles-cache', false)
         const cachedProfiles = cachedProfilesRes?.data?.profiles ?? []
         if (cachedProfiles.length > 0) {
-          hasProfiles = true
           setProfiles(cachedProfiles)
           setSelectedIccid((current) => {
             const nextSelectedIccid = preferredProfileIccid(cachedProfiles, current)
@@ -880,23 +875,22 @@ export default function EsimManagerPage() {
         setProfilesLoading(false)
       }
 
-      const shouldLoadLiveProfiles = forceLive || !hasProfiles
-      if (shouldLoadLiveProfiles) {
-        setProfilesLoading(true)
-        const profilesRes = await requestOrNull(api.getEsimProfiles(), 'profiles')
-        setProfilesLoading(false)
-        if (profilesRes?.data) {
-          const nextProfiles = profilesRes.data.profiles ?? []
-          setProfiles(nextProfiles)
-          setSelectedIccid((current) => {
-            const nextSelectedIccid = preferredProfileIccid(nextProfiles, current)
-            updateEsimPageSnapshot({
-              profiles: nextProfiles,
-              selectedIccid: nextSelectedIccid,
-            })
-            return nextSelectedIccid
+      // Cached profiles make the page responsive, but only a fresh eUICC
+      // listing can remove a profile that was deleted or replaced in-place.
+      setProfilesLoading(true)
+      const profilesRes = await requestOrNull(api.getEsimProfiles(), 'profiles')
+      setProfilesLoading(false)
+      if (profilesRes?.data) {
+        const nextProfiles = profilesRes.data.profiles ?? []
+        setProfiles(nextProfiles)
+        setSelectedIccid((current) => {
+          const nextSelectedIccid = preferredProfileIccid(nextProfiles, current)
+          updateEsimPageSnapshot({
+            profiles: nextProfiles,
+            selectedIccid: nextSelectedIccid,
           })
-        }
+          return nextSelectedIccid
+        })
       }
 
       if (failures.length > 0) {

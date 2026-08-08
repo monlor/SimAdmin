@@ -315,6 +315,18 @@ fn cache_esim_profiles(db: &Database, profiles: &[EsimProfile]) {
             warn!(iccid = %profile.iccid, error = %err, "Failed to write eSIM profile cache");
         }
     }
+    let live_iccids = profiles
+        .iter()
+        .map(|profile| profile.iccid.clone())
+        .collect::<Vec<_>>();
+    match db.prune_esim_profile_cache(&live_iccids) {
+        Ok(0) => {}
+        Ok(deleted) => info!(
+            deleted,
+            "Pruned stale eSIM profile cache entries after live refresh"
+        ),
+        Err(err) => warn!(error = %err, "Failed to prune stale eSIM profile cache entries"),
+    }
 }
 
 fn profile_from_cache_entry(entry: EsimProfileCacheEntry) -> EsimProfile {
