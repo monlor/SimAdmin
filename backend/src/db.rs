@@ -1821,6 +1821,15 @@ impl Database {
         Ok(())
     }
 
+    /// Profiles belong to the physical eUICC that reported them.  When that
+    /// card changes, the old profile list must never be used as a fast cache
+    /// for the replacement card.
+    pub fn clear_esim_profile_cache(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM esim_profile_cache", [])?;
+        Ok(())
+    }
+
     // ==================== eUICC cache ====================
 
     pub fn upsert_esim_euicc_cache(&self, entry: &EsimEuiccCacheEntry) -> Result<()> {
@@ -2296,6 +2305,9 @@ mod tests {
         assert_eq!(listed[0].state.as_deref(), Some("enabled"));
         assert_eq!(listed[0].disable_allowed, Some(false));
         assert_eq!(listed[0].delete_allowed, Some(true));
+
+        db.clear_esim_profile_cache().unwrap();
+        assert!(db.list_esim_profile_cache().unwrap().is_empty());
     }
 
     #[test]

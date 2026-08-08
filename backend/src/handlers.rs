@@ -354,6 +354,12 @@ fn cached_profiles_requested(query: &std::collections::HashMap<String, String>) 
         .unwrap_or(false)
 }
 
+fn esim_euicc_eid_changed(previous_eid: &str, current_eid: &str) -> bool {
+    let previous = previous_eid.trim();
+    let current = current_eid.trim();
+    !previous.is_empty() && !current.is_empty() && previous != current
+}
+
 // ============ 工作模式 / eSIM ============
 
 fn live_refresh_requested(query: &std::collections::HashMap<String, String>) -> bool {
@@ -735,11 +741,26 @@ pub async fn get_esim_euicc_handler(
     match app.esim_supervisor.get_euicc_info().await {
         Ok(mut data) => {
             data.updated_at = Some(chrono::Utc::now().to_rfc3339());
+            let previous_eid = match app.database.latest_esim_euicc_cache() {
+                Ok(Some(entry)) => entry.eid,
+                Ok(None) => String::new(),
+                Err(err) => {
+                    warn!(error = %err, "Failed to read previous eUICC cache");
+                    String::new()
+                }
+            };
             if let Err(err) = app
                 .database
                 .upsert_esim_euicc_cache(&euicc_cache_entry(&data))
             {
                 warn!(error = %err, "Failed to write eUICC cache");
+            }
+            if esim_euicc_eid_changed(&previous_eid, &data.eid) {
+                if let Err(err) = app.database.clear_esim_profile_cache() {
+                    warn!(error = %err, "Failed to clear stale eSIM profile cache after eUICC change");
+                } else {
+                    info!(previous_eid = %previous_eid, current_eid = %data.eid, "Cleared eSIM profile cache after eUICC change");
+                }
             }
             (
                 StatusCode::OK,
@@ -842,156 +863,116 @@ pub async fn enable_esim_profile_handler(
 ) -> impl IntoResponse {
     let event_entity = mask_identifier(&iccid);
 
-    modem_manager::reset_baseband_restart_progress();
+    // Do not hold Profile switching behind an existing baseband recovery.
+    // The eUICC command is serialized by EsimSupervisor's lpac lock; every
+    // successful switch can schedule its own signal recovery afterwards.
     modem_manager::record_restart_step("启用 eSIM Profile", "running", None);
 
+    let result = enable_esim_profile_for_switch(&app, &iccid).await;
+    let response = match result {
+        Ok(EsimProfileEnableOutcome::Enabled(response)) => response,
+        Ok(EsimProfileEnableOutcome::AlreadyEnabled(response)) => {
+            modem_manager::record_restart_step(
+                "启用 eSIM Profile",
+                "ok",
+                Some(response.msg.clone()),
+            );
+            modem_manager::finish_baseband_restart_progress();
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "Profile already enabled",
+                    response,
+                )),
+            );
+        }
+        Ok(EsimProfileEnableOutcome::Failed(response)) => {
+            modem_manager::record_restart_step(
+                "启用 eSIM Profile",
+                "error",
+                Some(response.msg.clone()),
+            );
+            modem_manager::finish_baseband_restart_progress();
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message("Profile enable failed", response)),
+            );
+        }
+        Err(err) => {
+            let message = err.message();
+            modem_manager::record_restart_step("启用 eSIM Profile", "error", Some(message.clone()));
+            modem_manager::finish_baseband_restart_progress();
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "Profile enable failed",
+                    esim_command_failure("enable", message),
+                )),
+            );
+        }
+    };
+
+    // A successful switch supersedes the previous recovery's visible progress.
+    // Reset only now: a queued Profile command must not erase the recovery
+    // status for the currently active Profile before it has itself succeeded.
+    modem_manager::reset_baseband_restart_progress();
+    modem_manager::record_restart_step("启用 eSIM Profile", "ok", None);
     let bg_app = app.clone();
-    let bg_iccid = iccid.clone();
     let bg_event_entity = event_entity.clone();
-
     tokio::spawn(async move {
-        let _guard = modem_manager::BasebandRestartRunGuard;
-
-        match enable_esim_profile_for_switch(&bg_app, &bg_iccid).await {
-            Ok(EsimProfileEnableOutcome::Enabled(data)) => {
-                if esim_command_succeeded(&data) {
-                    modem_manager::record_restart_step("启用 eSIM Profile", "ok", None);
-                    let auto_connect_data = !bg_app.data_user_disabled.load(Ordering::SeqCst);
-                    let allow_roaming = bg_app.config_manager.get_roaming_allowed();
-                    let apn_config = bg_app.config_manager.get_apn_config();
-                    match power_cycle_sim_for_profile_switch(
-                        &bg_app.dbus_conn,
-                        auto_connect_data,
-                        allow_roaming,
-                        Some(apn_config),
-                    )
-                    .await
-                    {
-                        Ok(_recovery) => {
-                            if bg_app.sms_resync.request_scan("profile-switch") {
-                                info!("Requested SMS resync after eSIM profile switch");
-                            } else {
-                                warn!("Failed to request SMS resync after eSIM profile switch");
-                            }
-                            bg_app
-                                .system_event_emitter
-                                .emit_code(
-                                    system_event_codes::ESIM_PROFILE_ENABLE_SUCCEEDED,
-                                    system_event_severity::INFO,
-                                    system_event_status::SUCCEEDED,
-                                    bg_event_entity,
-                                    "Profile 启用成功，基带恢复完成",
-                                )
-                                .await;
-                        }
-                        Err(err) => {
-                            bg_app
-                                .system_event_emitter
-                                .emit_code(
-                                    system_event_codes::ESIM_PROFILE_SWITCH_BASEBAND_RECOVERY_FAILED,
-                                    system_event_severity::CRITICAL,
-                                    system_event_status::FAILED,
-                                    bg_event_entity,
-                                    format!("Profile 切换后基带恢复失败: {err}"),
-                                )
-                                .await;
-                            if bg_app
-                                .sms_resync
-                                .request_scan("profile-switch-recovery-failed")
-                            {
-                                info!("Requested SMS resync after failed eSIM profile recovery");
-                            } else {
-                                warn!(
-                                    "Failed to request SMS resync after failed eSIM profile recovery"
-                                );
-                            }
-                        }
-                    }
+        let _guard = modem_manager::BasebandRestartRunGuard::new();
+        let auto_connect_data = !bg_app.data_user_disabled.load(Ordering::SeqCst);
+        let allow_roaming = bg_app.config_manager.get_roaming_allowed();
+        let apn_config = bg_app.config_manager.get_apn_config();
+        match power_cycle_sim_for_profile_switch(
+            &bg_app.dbus_conn,
+            auto_connect_data,
+            allow_roaming,
+            Some(apn_config),
+        )
+        .await
+        {
+            Ok(_recovery) => {
+                if bg_app.sms_resync.request_scan("profile-switch") {
+                    info!("Requested SMS resync after eSIM profile switch");
                 } else {
-                    modem_manager::record_restart_step(
-                        "启用 eSIM Profile",
-                        "error",
-                        Some(data.msg.clone()),
-                    );
-                    bg_app
-                        .system_event_emitter
-                        .emit_code(
-                            system_event_codes::ESIM_PROFILE_ENABLE_FAILED,
-                            system_event_severity::WARNING,
-                            system_event_status::FAILED,
-                            bg_event_entity.clone(),
-                            format!("Profile 启用失败: {}", data.msg),
-                        )
-                        .await;
+                    warn!("Failed to request SMS resync after eSIM profile switch");
                 }
-            }
-            Ok(EsimProfileEnableOutcome::AlreadyEnabled(data)) => {
-                modem_manager::record_restart_step(
-                    "启用 eSIM Profile",
-                    "ok",
-                    Some(data.msg.clone()),
-                );
                 bg_app
                     .system_event_emitter
                     .emit_code(
                         system_event_codes::ESIM_PROFILE_ENABLE_SUCCEEDED,
                         system_event_severity::INFO,
                         system_event_status::SUCCEEDED,
-                        bg_event_entity.clone(),
-                        "Profile 已是启用状态，无需重复切换",
-                    )
-                    .await;
-            }
-            Ok(EsimProfileEnableOutcome::Failed(data)) => {
-                modem_manager::record_restart_step(
-                    "启用 eSIM Profile",
-                    "error",
-                    Some(data.msg.clone()),
-                );
-                bg_app
-                    .system_event_emitter
-                    .emit_code(
-                        system_event_codes::ESIM_PROFILE_ENABLE_FAILED,
-                        system_event_severity::WARNING,
-                        system_event_status::FAILED,
-                        bg_event_entity.clone(),
-                        format!("Profile 启用失败: {}", data.msg),
+                        bg_event_entity,
+                        "Profile 启用成功，基带恢复完成",
                     )
                     .await;
             }
             Err(err) => {
-                let message = err.message();
-                modem_manager::record_restart_step(
-                    "启用 eSIM Profile",
-                    "error",
-                    Some(message.clone()),
-                );
                 bg_app
                     .system_event_emitter
                     .emit_code(
-                        system_event_codes::ESIM_PROFILE_ENABLE_FAILED,
-                        system_event_severity::WARNING,
+                        system_event_codes::ESIM_PROFILE_SWITCH_BASEBAND_RECOVERY_FAILED,
+                        system_event_severity::CRITICAL,
                         system_event_status::FAILED,
-                        bg_event_entity.clone(),
-                        format!("Profile 启用失败: {message}"),
+                        bg_event_entity,
+                        format!("Profile 切换后基带恢复失败: {err}"),
                     )
                     .await;
+                if bg_app.sms_resync.request_scan("profile-switch-recovery-failed") {
+                    info!("Requested SMS resync after failed eSIM profile recovery");
+                } else {
+                    warn!("Failed to request SMS resync after failed eSIM profile recovery");
+                }
             }
         }
     });
 
-    let response = EsimCommandResponse {
-        code: 0,
-        status: "success".to_string(),
-        action: "enable".to_string(),
-        msg: "Profile enable task started in background".to_string(),
-        data: None,
-    };
-
     (
         StatusCode::OK,
         Json(ApiResponse::success_with_message(
-            "Profile enable requested",
+            "Profile enabled; baseband recovery started",
             response,
         )),
     )
@@ -4537,6 +4518,16 @@ mod tests {
 
         assert_eq!(profiles[0].state, "disabled");
         assert_eq!(profiles[1].state, "enabled");
+    }
+
+    #[test]
+    fn detects_when_a_profile_cache_belongs_to_a_different_euicc() {
+        assert!(esim_euicc_eid_changed(
+            "89086030000000000000000000000001",
+            "89086030000000000000000000000002"
+        ));
+        assert!(!esim_euicc_eid_changed("EID001", " EID001 "));
+        assert!(!esim_euicc_eid_changed("", "EID002"));
     }
 
     #[test]

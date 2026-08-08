@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::fs;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::process::Command;
@@ -90,6 +90,7 @@ static MODEM_DISCOVERY_FAILURE: std::sync::Mutex<Option<(Instant, String)>> =
 static BASEBAND_RESTART_STEPS: std::sync::Mutex<Vec<BasebandRestartStep>> =
     std::sync::Mutex::new(Vec::new());
 static BASEBAND_RESTART_RUNNING: AtomicBool = AtomicBool::new(false);
+static BASEBAND_RESTART_ACTIVE_RUNS: AtomicUsize = AtomicUsize::new(0);
 static BASEBAND_RESTART_REGISTRATION: std::sync::Mutex<Option<String>> =
     std::sync::Mutex::new(None);
 
@@ -5849,6 +5850,12 @@ pub fn reset_baseband_restart_progress() {
     BASEBAND_RESTART_RUNNING.store(true, Ordering::SeqCst);
 }
 
+pub fn finish_baseband_restart_progress() {
+    if BASEBAND_RESTART_ACTIVE_RUNS.load(Ordering::SeqCst) == 0 {
+        BASEBAND_RESTART_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
 fn set_baseband_restart_registration(value: Option<String>) {
     if let Ok(mut registration) = BASEBAND_RESTART_REGISTRATION.lock() {
         *registration = value;
@@ -5868,9 +5875,19 @@ pub fn record_restart_step(step: &str, status: &str, detail: Option<String>) {
 
 pub struct BasebandRestartRunGuard;
 
+impl BasebandRestartRunGuard {
+    pub fn new() -> Self {
+        BASEBAND_RESTART_ACTIVE_RUNS.fetch_add(1, Ordering::SeqCst);
+        BASEBAND_RESTART_RUNNING.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+
 impl Drop for BasebandRestartRunGuard {
     fn drop(&mut self) {
-        BASEBAND_RESTART_RUNNING.store(false, Ordering::SeqCst);
+        if BASEBAND_RESTART_ACTIVE_RUNS.fetch_sub(1, Ordering::SeqCst) == 1 {
+            BASEBAND_RESTART_RUNNING.store(false, Ordering::SeqCst);
+        }
     }
 }
 
@@ -5897,7 +5914,7 @@ pub async fn restart_baseband(
     configured_apn: Option<ApnConfig>,
 ) -> Result<BasebandRestartResponse, String> {
     reset_baseband_restart_progress();
-    let _progress_guard = BasebandRestartRunGuard;
+    let _progress_guard = BasebandRestartRunGuard::new();
     with_serial(async move {
         restart_baseband_inner(
             conn,
