@@ -20,7 +20,6 @@ import {
   ListItemText,
   MenuItem,
   Snackbar,
-  Stack,
   TextField,
   Tooltip,
   Typography,
@@ -49,7 +48,7 @@ import { alpha, type Theme } from '@mui/material/styles'
 import { api } from '../api/current'
 import ErrorSnackbar from '../components/ErrorSnackbar'
 import { formatCarrierName } from '../utils/carriers'
-import type { BasebandRestartStep, EsimCommandResponse, EsimEuiccInfo, EsimLpacStatusResponse, EsimProfile } from '../api/types'
+import type { EsimCommandResponse, EsimEuiccInfo, EsimLpacStatusResponse, EsimProfile } from '../api/types'
 
 type ConfirmAction = 'enable' | 'delete' | null
 const CONFIRM_DELETE_PROFILE = '确认删除'
@@ -585,13 +584,6 @@ export default function EsimManagerPage() {
   const [totalMemoryInput, setTotalMemoryInput] = useState('')
   const [savingTotalMemory, setSavingTotalMemory] = useState(false)
 
-  // Baseband recovery progress tracking (shown after profile enable)
-  const [basebandRecoveryOpen, setBasebandRecoveryOpen] = useState(false)
-  const [basebandRecoveryRunning, setBasebandRecoveryRunning] = useState(false)
-  const [basebandRecoverySteps, setBasebandRecoverySteps] = useState<BasebandRestartStep[]>([])
-  const [basebandRecoveryRegistration, setBasebandRecoveryRegistration] = useState<string | null>(null)
-  const basebandRecoveryTimerRef = useRef<number | undefined>(undefined)
-
   const euiccCardRef = useRef<HTMLDivElement | null>(null)
   const [gridHeight, setGridHeight] = useState<string | number>('calc(100vh - 350px)')
 
@@ -623,6 +615,11 @@ export default function EsimManagerPage() {
     const val = parseInt(totalMemoryInput, 10)
     if (isNaN(val) || val <= 0) {
       setError('请输入有效的正整数容量（单位：KB）')
+      return
+    }
+    const availableMemory = euicc?.memory_available_kb
+    if (typeof availableMemory === 'number' && Number.isFinite(availableMemory) && val < Math.ceil(availableMemory)) {
+      setError(`总容量不能小于当前可用容量（${formatCapacityK(availableMemory)}）`)
       return
     }
     setSavingTotalMemory(true)
@@ -933,70 +930,6 @@ export default function EsimManagerPage() {
     }
   }
 
-  const loadBasebandRecoveryStatus = async () => {
-    try {
-      const res = await api.getBasebandRestartStatus()
-      const data = res.data
-      if (data) {
-        setBasebandRecoverySteps(data.steps ?? [])
-        setBasebandRecoveryRegistration(data.current_registration ?? null)
-        if (!data.running) return true // finished
-      }
-    } catch { /* ignore polling errors */ }
-    return false
-  }
-
-  const startBasebandRecoveryPolling = () => {
-    if (basebandRecoveryTimerRef.current !== undefined) {
-      window.clearInterval(basebandRecoveryTimerRef.current)
-      basebandRecoveryTimerRef.current = undefined
-    }
-    setBasebandRecoveryOpen(true)
-    setBasebandRecoveryRunning(true)
-    setBasebandRecoverySteps([])
-    setBasebandRecoveryRegistration(null)
-
-    const handleStatusResult = (finished: boolean) => {
-      if (finished) {
-        if (basebandRecoveryTimerRef.current !== undefined) {
-          window.clearInterval(basebandRecoveryTimerRef.current)
-          basebandRecoveryTimerRef.current = undefined
-        }
-        setBasebandRecoveryRunning(false)
-        void loadData(true)
-      }
-    }
-
-    // Poll every 1s until baseband recovery finishes
-    const timer = window.setInterval(() => {
-      void loadBasebandRecoveryStatus().then(handleStatusResult)
-    }, 1000)
-    basebandRecoveryTimerRef.current = timer
-    void loadBasebandRecoveryStatus().then(handleStatusResult)
-  }
-
-  // Cleanup polling timer on unmount
-  useEffect(() => {
-    return () => {
-      if (basebandRecoveryTimerRef.current !== undefined) {
-        window.clearInterval(basebandRecoveryTimerRef.current)
-      }
-    }
-  }, [])
-
-  const getRecoveryErrorStep = () => basebandRecoverySteps.find(s => s.status === 'error')
-
-  const getCurrentRecoveryMessage = () => {
-    const errorStep = getRecoveryErrorStep()
-    if (errorStep) return errorStep.detail || `${errorStep.step} 失败`
-    if (!basebandRecoveryRunning && basebandRecoverySteps.length > 0) {
-      return '网络恢复成功！'
-    }
-    if (basebandRecoverySteps.length === 0) return '正在启动恢复程序...'
-    const lastStep = basebandRecoverySteps[basebandRecoverySteps.length - 1]
-    return lastStep.status === 'running' ? `正在进行：${lastStep.step}` : `已完成：${lastStep.step}`
-  }
-
   const runProfileAction = async () => {
     if (!selectedProfile || !confirmAction) return
     if (confirmAction === 'delete' && deleteConfirmText !== CONFIRM_DELETE_PROFILE) return
@@ -1015,9 +948,9 @@ export default function EsimManagerPage() {
       setConfirmAction(null)
       setDeleteConfirmText('')
       if (action === 'enable') {
-        // The Profile command is complete; only the baseband restart and
-        // network-registration recovery continue in the background.
-        setSuccess('Profile 已切换，基带正在恢复…')
+        // The Profile command is the user-visible completion point. Baseband
+        // recovery and network registration continue in the backend.
+        setSuccess('Profile 已切换；基带与网络正在后台恢复')
         setSelectedIccid(targetIccid)
         updateEsimPageSnapshot({ selectedIccid: targetIccid })
         setProfiles((current) => {
@@ -1031,7 +964,6 @@ export default function EsimManagerPage() {
           updateEsimPageSnapshot({ profiles: nextProfiles })
           return nextProfiles
         })
-        startBasebandRecoveryPolling()
       } else {
         setSuccess('Profile 删除完成')
         setProfiles((current) => {
@@ -1104,14 +1036,19 @@ export default function EsimManagerPage() {
   const memoryAvailable = typeof euicc?.memory_available_kb === 'number' && Number.isFinite(euicc.memory_available_kb)
     ? euicc.memory_available_kb
     : null
-  const hasMemoryInfo = memoryTotal !== null || memoryAvailable !== null
+  const canSetMemoryTotal = euicc?.memory_total_customizable === true
+  const hasMemoryInfo = memoryTotal !== null || memoryAvailable !== null || canSetMemoryTotal
   const memoryUsedPercent = memoryTotal !== null && memoryAvailable !== null && memoryTotal > 0
     ? Math.max(0, Math.min(100, ((memoryTotal - memoryAvailable) / memoryTotal) * 100))
     : null
-  const memoryPercentLabel = memoryUsedPercent !== null ? `${Math.round(memoryUsedPercent)}%` : 'N/A'
+  const memoryPercentLabel = memoryUsedPercent !== null
+    ? `${Math.round(memoryUsedPercent)}%`
+    : canSetMemoryTotal
+      ? '待设置'
+      : 'N/A'
   const memoryUsageLabel = memoryAvailable !== null
     ? `可用 ${formatCapacityK(memoryAvailable)} / ${memoryTotal !== null ? formatCapacityK(memoryTotal) : '未知'}`
-    : `总容量 ${formatCapacityK(memoryTotal)}`
+    : memoryTotal !== null ? `总容量 ${formatCapacityK(memoryTotal)}` : '总容量未知'
   const dataLoading = statusLoading || profilesLoading || euiccLoading
   const showManagerContent = statusLoading || lpacStatus?.usable
   const euiccManufacturer = euiccManufacturerFromEid(euicc?.eid) || euicc?.manufacturer || 'N/A'
@@ -1251,33 +1188,22 @@ export default function EsimManagerPage() {
                     sx={{
                       width: { xs: '100%', md: 300 },
                       ml: { md: 'auto' },
-                      '& .edit-capacity-btn': {
-                        opacity: 0,
-                        visibility: 'hidden',
-                        transition: 'opacity 0.2s ease, visibility 0.2s ease',
-                      },
-                      '&:hover .edit-capacity-btn': {
-                        opacity: 1,
-                        visibility: 'visible',
-                      },
                     }}
                   >
                     <Box display="flex" alignItems="center" justifyContent="space-between" gap={1} mb={0.75}>
-                      <Typography variant="caption" color="text.secondary" display="inline-flex" alignItems="center" gap={0.5}>
-                        eUICC 容量
-                        {euicc?.memory_total_customizable && (
-                          <Tooltip title="自定义总容量">
-                            <IconButton
-                              className="edit-capacity-btn"
-                              size="small"
-                              onClick={handleOpenTotalMemoryDialog}
-                              sx={{ p: 0.25 }}
-                            >
-                              <Edit sx={{ fontSize: 13 }} />
-                            </IconButton>
-                          </Tooltip>
+                      <Box display="flex" alignItems="center" gap={0.5}>
+                        <Typography variant="caption" color="text.secondary">eUICC 容量</Typography>
+                        {canSetMemoryTotal && (
+                          <Button
+                            size="small"
+                            startIcon={<Edit sx={{ fontSize: 13 }} />}
+                            onClick={handleOpenTotalMemoryDialog}
+                            sx={{ minWidth: 0, px: 0.75, py: 0.125, fontSize: '0.75rem' }}
+                          >
+                            设置总容量
+                          </Button>
                         )}
-                      </Typography>
+                      </Box>
                       <Typography variant="caption" color="text.primary" fontWeight={400}>
                         {memoryPercentLabel}
                       </Typography>
@@ -1843,44 +1769,6 @@ export default function EsimManagerPage() {
             startIcon={actionLoading ? <CircularProgress size={16} /> : undefined}
           >
             {confirmAction === 'delete' ? '确认删除' : '确认'}
-          </Button>
-        </DialogActions>
-      </Dialog>
-
-      <Dialog
-        open={basebandRecoveryOpen}
-        onClose={() => { if (!basebandRecoveryRunning) setBasebandRecoveryOpen(false) }}
-        maxWidth="xs"
-        fullWidth
-      >
-        <DialogTitle>eSIM 切卡恢复</DialogTitle>
-        <DialogContent>
-          <Stack spacing={2} alignItems="center" sx={{ py: 2 }}>
-            {basebandRecoveryRunning && !getRecoveryErrorStep() && (
-              <CircularProgress size={48} />
-            )}
-            {getRecoveryErrorStep() ? (
-              <Alert severity="error" sx={{ width: '100%' }}>{getCurrentRecoveryMessage()}</Alert>
-            ) : !basebandRecoveryRunning && basebandRecoverySteps.length > 0 ? (
-              <Alert severity="success" sx={{ width: '100%' }}>{getCurrentRecoveryMessage()}</Alert>
-            ) : (
-              <Typography variant="body1" color="text.secondary" textAlign="center">
-                {getCurrentRecoveryMessage()}
-              </Typography>
-            )}
-            {basebandRecoveryRegistration && basebandRecoveryRunning && (
-              <Typography variant="caption" color="text.secondary" textAlign="center">
-                当前注册状态：{basebandRecoveryRegistration}
-              </Typography>
-            )}
-          </Stack>
-        </DialogContent>
-        <DialogActions>
-          <Button
-            disabled={basebandRecoveryRunning}
-            onClick={() => setBasebandRecoveryOpen(false)}
-          >
-            关闭
           </Button>
         </DialogActions>
       </Dialog>

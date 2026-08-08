@@ -13,9 +13,9 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
 use std::process::{Command, Output};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use zbus::Connection;
@@ -54,6 +54,80 @@ const ESIM_SIM_IDENTITY_TIMEOUT_SECS: u64 = 3;
 const ESIM_CACHED_SIM_IDENTITY_TIMEOUT_MS: u64 = 800;
 const SMS_DB_MAINTENANCE_DELETE_THRESHOLD: usize = 100;
 const SMS_DB_MAINTENANCE_DELAY_SECS: u64 = 60;
+
+static PROFILE_SWITCH_RECOVERY: std::sync::Mutex<Option<ProfileSwitchRecoveryStatus>> =
+    std::sync::Mutex::new(None);
+static PROFILE_SWITCH_RECOVERY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn start_profile_switch(iccid: &str) -> String {
+    let sequence = PROFILE_SWITCH_RECOVERY_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let operation_id = format!("profile-switch-{timestamp}-{sequence}");
+    if let Ok(mut task) = PROFILE_SWITCH_RECOVERY.lock() {
+        *task = Some(ProfileSwitchRecoveryStatus {
+            operation_id: operation_id.clone(),
+            profile_iccid: mask_identifier(iccid),
+            phase: "switching".to_string(),
+            steps: vec![BasebandRestartStep {
+                step: "切换 eSIM Profile".to_string(),
+                status: "running".to_string(),
+                detail: None,
+            }],
+            running: true,
+            current_registration: None,
+            error: None,
+        });
+    }
+    operation_id
+}
+
+fn begin_profile_switch_recovery(operation_id: &str) {
+    let progress = get_baseband_restart_progress();
+    if let Ok(mut task) = PROFILE_SWITCH_RECOVERY.lock() {
+        if let Some(task) = task
+            .as_mut()
+            .filter(|task| task.operation_id == operation_id)
+        {
+            task.phase = "recovering".to_string();
+            task.steps = progress.steps;
+            task.current_registration = progress.current_registration;
+        }
+    }
+}
+
+fn finish_profile_switch_recovery(operation_id: &str, error: Option<String>) {
+    let progress = get_baseband_restart_progress();
+    if let Ok(mut task) = PROFILE_SWITCH_RECOVERY.lock() {
+        if let Some(task) = task
+            .as_mut()
+            .filter(|task| task.operation_id == operation_id)
+        {
+            task.steps = progress.steps;
+            task.current_registration = progress.current_registration;
+            task.running = false;
+            task.error = error;
+            task.phase = if task.error.is_some() {
+                "failed"
+            } else {
+                "completed"
+            }
+            .to_string();
+        }
+    }
+}
+
+pub fn get_profile_switch_recovery_status() -> Option<ProfileSwitchRecoveryStatus> {
+    let progress = get_baseband_restart_progress();
+    let mut task = PROFILE_SWITCH_RECOVERY.lock().ok()?.clone()?;
+    if task.running && task.phase == "recovering" {
+        task.steps = progress.steps;
+        task.current_registration = progress.current_registration;
+    }
+    Some(task)
+}
 
 // ============ 基础接口 ============
 
@@ -795,7 +869,8 @@ pub async fn get_esim_profiles_handler(
                     entries.into_iter().map(profile_from_cache_entry).collect();
                 let needs_identity = profiles.iter().any(|profile| {
                     esim_profile_state_is_unknown(&profile.state)
-                        || esim_profile_is_active(profile) && esim_profile_sim_details_missing(profile)
+                        || esim_profile_is_active(profile)
+                            && esim_profile_sim_details_missing(profile)
                 });
                 if needs_identity {
                     match tokio::time::timeout(
@@ -874,6 +949,7 @@ pub async fn enable_esim_profile_handler(
     Path(iccid): Path<String>,
 ) -> impl IntoResponse {
     let event_entity = mask_identifier(&iccid);
+    let operation_id = start_profile_switch(&iccid);
 
     // Do not hold Profile switching behind an existing baseband recovery.
     // The eUICC command is serialized by EsimSupervisor's lpac lock; every
@@ -890,6 +966,7 @@ pub async fn enable_esim_profile_handler(
                 Some(response.msg.clone()),
             );
             modem_manager::finish_baseband_restart_progress();
+            finish_profile_switch_recovery(&operation_id, None);
             return (
                 StatusCode::OK,
                 Json(ApiResponse::success_with_message(
@@ -905,15 +982,20 @@ pub async fn enable_esim_profile_handler(
                 Some(response.msg.clone()),
             );
             modem_manager::finish_baseband_restart_progress();
+            finish_profile_switch_recovery(&operation_id, Some(response.msg.clone()));
             return (
                 StatusCode::OK,
-                Json(ApiResponse::success_with_message("Profile enable failed", response)),
+                Json(ApiResponse::success_with_message(
+                    "Profile enable failed",
+                    response,
+                )),
             );
         }
         Err(err) => {
             let message = err.message();
             modem_manager::record_restart_step("启用 eSIM Profile", "error", Some(message.clone()));
             modem_manager::finish_baseband_restart_progress();
+            finish_profile_switch_recovery(&operation_id, Some(message.clone()));
             return (
                 StatusCode::OK,
                 Json(ApiResponse::success_with_message(
@@ -929,6 +1011,7 @@ pub async fn enable_esim_profile_handler(
     // status for the currently active Profile before it has itself succeeded.
     modem_manager::reset_baseband_restart_progress();
     modem_manager::record_restart_step("启用 eSIM Profile", "ok", None);
+    begin_profile_switch_recovery(&operation_id);
     let bg_app = app.clone();
     let bg_event_entity = event_entity.clone();
     tokio::spawn(async move {
@@ -945,6 +1028,7 @@ pub async fn enable_esim_profile_handler(
         .await
         {
             Ok(_recovery) => {
+                finish_profile_switch_recovery(&operation_id, None);
                 if bg_app.sms_resync.request_scan("profile-switch") {
                     info!("Requested SMS resync after eSIM profile switch");
                 } else {
@@ -962,6 +1046,7 @@ pub async fn enable_esim_profile_handler(
                     .await;
             }
             Err(err) => {
+                finish_profile_switch_recovery(&operation_id, Some(err.clone()));
                 bg_app
                     .system_event_emitter
                     .emit_code(
@@ -972,7 +1057,10 @@ pub async fn enable_esim_profile_handler(
                         format!("Profile 切换后基带恢复失败: {err}"),
                     )
                     .await;
-                if bg_app.sms_resync.request_scan("profile-switch-recovery-failed") {
+                if bg_app
+                    .sms_resync
+                    .request_scan("profile-switch-recovery-failed")
+                {
                     info!("Requested SMS resync after failed eSIM profile recovery");
                 } else {
                     warn!("Failed to request SMS resync after failed eSIM profile recovery");
@@ -986,6 +1074,17 @@ pub async fn enable_esim_profile_handler(
         Json(ApiResponse::success_with_message(
             "Profile enabled; baseband recovery started",
             response,
+        )),
+    )
+}
+
+/// GET /api/esim/profile-switch/status
+pub async fn get_profile_switch_recovery_status_handler() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            get_profile_switch_recovery_status(),
         )),
     )
 }

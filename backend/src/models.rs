@@ -279,6 +279,19 @@ pub struct BasebandRestartResponse {
     pub current_registration: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileSwitchRecoveryStatus {
+    pub operation_id: String,
+    pub profile_iccid: String,
+    pub phase: String,
+    pub steps: Vec<BasebandRestartStep>,
+    pub running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_registration: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct ThermalZone {
     pub zone: String,

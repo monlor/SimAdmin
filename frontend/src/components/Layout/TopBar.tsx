@@ -10,6 +10,7 @@ import {
   DialogContent,
   DialogTitle,
   Divider,
+  Drawer,
   IconButton,
   ListItemIcon,
   ListItemText,
@@ -34,7 +35,7 @@ import {
 import { useTheme } from '../../contexts/ThemeContext'
 import { useRefreshInterval } from '../../contexts/RefreshContext'
 import { api } from '../../api/current'
-import type { BasebandRestartResponse, BasebandRestartStep } from '../../api/types'
+import type { BasebandRestartResponse, BasebandRestartStep, ProfileSwitchRecoveryStatus } from '../../api/types'
 
 const TOPBAR_TRANSITION = '300ms cubic-bezier(0.4, 0, 0.2, 1)'
 
@@ -83,7 +84,10 @@ export default function TopBar({
   const [deviceRebootProgressOpen, setDeviceRebootProgressOpen] = useState(false)
   const [deviceRebootSteps, setDeviceRebootSteps] = useState<BasebandRestartStep[]>([])
   const [restartConfirmTarget, setRestartConfirmTarget] = useState<RestartConfirmTarget | null>(null)
+  const [profileSwitchStatus, setProfileSwitchStatus] = useState<ProfileSwitchRecoveryStatus | null>(null)
+  const [profileSwitchDetailsOpen, setProfileSwitchDetailsOpen] = useState(false)
   const deviceRebootTimersRef = useRef<number[]>([])
+  const dismissedProfileSwitchRef = useRef<string | null>(null)
   const title = drawerWidth <= 80 ? 'SimAdmin - SIM/eSIM 中枢' : 'SIM/eSIM 中枢'
 
   useEffect(() => {
@@ -92,6 +96,40 @@ export default function TopBar({
       deviceRebootTimersRef.current = []
     }
   }, [])
+
+  useEffect(() => {
+    let disposed = false
+    const loadProfileSwitchStatus = async () => {
+      try {
+        const response = await api.getProfileSwitchRecoveryStatus()
+        const status = response.data ?? null
+        if (disposed) return
+        if (status?.phase === 'completed' && dismissedProfileSwitchRef.current === status.operation_id) {
+          setProfileSwitchStatus(null)
+        } else {
+          setProfileSwitchStatus(status)
+        }
+      } catch {
+        // A transient request failure must not hide the last known task state.
+      }
+    }
+    void loadProfileSwitchStatus()
+    const timer = window.setInterval(() => void loadProfileSwitchStatus(), 2000)
+    return () => {
+      disposed = true
+      window.clearInterval(timer)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (profileSwitchStatus?.phase !== 'completed') return
+    const operationId = profileSwitchStatus.operation_id
+    const timer = window.setTimeout(() => {
+      dismissedProfileSwitchRef.current = operationId
+      setProfileSwitchStatus((current) => current?.operation_id === operationId ? null : current)
+    }, 5000)
+    return () => window.clearTimeout(timer)
+  }, [profileSwitchStatus?.operation_id, profileSwitchStatus?.phase])
 
   const applyBasebandProgress = (data?: BasebandRestartResponse) => {
     if (!data) return
@@ -248,6 +286,24 @@ export default function TopBar({
     return `${refreshInterval / 1000}秒`
   }
 
+  const getProfileSwitchLabel = () => {
+    if (!profileSwitchStatus) return ''
+    if (profileSwitchStatus.phase === 'failed') return 'eSIM 恢复失败'
+    if (profileSwitchStatus.phase === 'completed') return 'eSIM 恢复完成'
+    if (profileSwitchStatus.phase === 'switching') return 'eSIM 切换中'
+    const completedSteps = profileSwitchStatus.steps.filter((step) => step.status !== 'running').length
+    const totalSteps = Math.max(profileSwitchStatus.steps.length, 1)
+    return `eSIM 恢复中 · ${completedSteps}/${totalSteps}`
+  }
+
+  const getProfileSwitchMessage = () => {
+    if (!profileSwitchStatus) return ''
+    if (profileSwitchStatus.error) return profileSwitchStatus.error
+    const currentStep = [...profileSwitchStatus.steps].reverse().find((step) => step.status === 'running')
+      ?? profileSwitchStatus.steps[profileSwitchStatus.steps.length - 1]
+    return currentStep ? `${currentStep.step}${currentStep.detail ? `：${currentStep.detail}` : ''}` : '正在启动基带与网络恢复'
+  }
+
   return (
     <AppBar
       position="static"
@@ -292,6 +348,24 @@ export default function TopBar({
         </Typography>
 
         <Box sx={{ display: 'flex', alignItems: 'center', gap: { xs: 0.5, sm: 1 } }}>
+          {profileSwitchStatus && (
+            <Button
+              size="small"
+              variant={profileSwitchStatus.phase === 'failed' ? 'outlined' : 'text'}
+              color={profileSwitchStatus.phase === 'failed' ? 'error' : profileSwitchStatus.phase === 'completed' ? 'success' : 'primary'}
+              onClick={() => setProfileSwitchDetailsOpen(true)}
+              startIcon={profileSwitchStatus.running ? <CircularProgress size={14} color="inherit" /> : undefined}
+              sx={{
+                minWidth: 0,
+                px: { xs: 0.75, sm: 1 },
+                whiteSpace: 'nowrap',
+                '& .MuiButton-startIcon': { mr: { xs: 0, sm: 0.5 } },
+              }}
+            >
+              <Box component="span" sx={{ display: { xs: 'none', md: 'inline' } }}>{getProfileSwitchLabel()}</Box>
+              <Box component="span" sx={{ display: { xs: 'inline', md: 'none' } }}>eSIM</Box>
+            </Button>
+          )}
           <Tooltip title="刷新页面">
             <IconButton color="default" onClick={triggerRefresh}>
               <RefreshIcon sx={{ fontSize: 22 }} />
@@ -353,6 +427,40 @@ export default function TopBar({
             手动刷新
           </MenuItem>
         </Menu>
+
+        <Drawer
+          anchor="right"
+          open={profileSwitchDetailsOpen}
+          onClose={() => setProfileSwitchDetailsOpen(false)}
+          slotProps={{ paper: { sx: { width: { xs: '100%', sm: 400 }, p: 3 } } }}
+        >
+          <Typography variant="h6" fontWeight={700}>eSIM 切换恢复</Typography>
+          {profileSwitchStatus && (
+            <>
+              <Alert severity={profileSwitchStatus.phase === 'failed' ? 'error' : profileSwitchStatus.phase === 'completed' ? 'success' : 'info'} sx={{ mt: 2 }}>
+                {getProfileSwitchMessage()}
+              </Alert>
+              {profileSwitchStatus.current_registration && profileSwitchStatus.running && (
+                <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1.5 }}>
+                  当前注册状态：{profileSwitchStatus.current_registration}
+                </Typography>
+              )}
+              <Stack spacing={1.25} sx={{ mt: 2.5 }}>
+                {profileSwitchStatus.steps.map((step, index) => (
+                  <Box key={`${step.step}-${index}`} sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
+                    {step.status === 'running' ? <CircularProgress size={16} /> : (
+                      <Box sx={{ width: 16, height: 16, borderRadius: '50%', bgcolor: step.status === 'error' ? 'error.main' : 'success.main', mt: 0.25 }} />
+                    )}
+                    <Box>
+                      <Typography variant="body2" fontWeight={600}>{step.step}</Typography>
+                      {step.detail && <Typography variant="caption" color="text.secondary">{step.detail}</Typography>}
+                    </Box>
+                  </Box>
+                ))}
+              </Stack>
+            </>
+          )}
+        </Drawer>
 
         <Dialog open={basebandProgressOpen} onClose={() => { if (!basebandRestarting) setBasebandProgressOpen(false) }} maxWidth="xs" fullWidth>
           <DialogTitle>重启基带</DialogTitle>

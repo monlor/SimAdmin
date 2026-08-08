@@ -45,6 +45,7 @@ import type {
   EsimLpacRepairResponse,
   EsimLpacStatusResponse,
   EsimProfilesResponse,
+  ProfileSwitchRecoveryStatus,
   LoginRequest,
   ManualRegisterRequest,
   NetworkInfo,
@@ -408,7 +409,8 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<EsimCommandResponse>>(`/esim/profiles/${encodeURIComponent(iccid)}/enable`, {
       method: 'POST',
       body: JSON.stringify({}),
-      timeoutMs: 10000,
+      // Profile 启用由后端最多执行 5 分钟；不能在前端 10 秒超时后误报失败。
+      timeoutMs: 300_000,
     })
   }
 
@@ -503,6 +505,10 @@ class SimAdminCurrentAPI {
 
   async getBasebandRestartStatus() {
     return request<ApiResponse<BasebandRestartResponse>>('/baseband/restart/status')
+  }
+
+  async getProfileSwitchRecoveryStatus() {
+    return request<ApiResponse<ProfileSwitchRecoveryStatus | null>>('/esim/profile-switch/status')
   }
 
   async restartService() {

@@ -706,6 +706,10 @@ async fn main() -> Result<()> {
             post(enable_esim_profile_handler).options(options_handler),
         )
         .route(
+            "/api/esim/profile-switch/status",
+            get(get_profile_switch_recovery_status_handler).options(options_handler),
+        )
+        .route(
             "/api/esim/profiles/{iccid}/rename",
             post(rename_esim_profile_handler).options(options_handler),
         )

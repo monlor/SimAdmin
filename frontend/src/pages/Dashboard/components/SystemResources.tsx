@@ -1,7 +1,7 @@
 import { Box, Card, CardContent, LinearProgress, SvgIcon, Typography, useTheme, type Theme } from '@mui/material'
 import Grid from '@mui/material/Grid'
 import { Memory, Speed as CpuIcon, Storage, Thermostat } from '@mui/icons-material'
-import { formatBytes, getCpuColor, getMemoryColor, getTempPercent, getTempBarColor, generateHeatmapGradient } from '../utils'
+import { formatBytes, getCpuColor, getMemoryColor, getTempBarColor, getTempPercent } from '../utils'
 import type { SystemStatsResponse, ThermalZone } from '@/api/types'
 
 interface SystemResourcesProps {
@@ -52,63 +52,19 @@ function resourceGradient(start: string, end: string) {
   }
 }
 
-function getTempDotColor(sensor: ThermalZone | null) {
-  if (!sensor) return 'text.disabled'
-  return getTempBarColor(sensor.temperature)
-}
-
-function getFriendlyTemperatureLabel(sensor: ThermalZone) {
-  if (sensor.label?.trim()) return sensor.label.trim()
-  const rawType = sensor.type.trim()
-  const source = rawType || sensor.zone || 'unknown'
-  const normalized = source.toLowerCase().replace(/_/g, '-')
-
-  if (/(modem|baseband|wwan|qmi|mhi)/.test(normalized)) return '基带'
-  if (/(gpu|adreno)/.test(normalized)) return 'GPU'
-  if (/(camera|cam|isp)/.test(normalized)) return '摄像头'
-  if (/(wifi|wlan)/.test(normalized)) return 'Wi-Fi'
-  if (/(battery|batt)/.test(normalized)) return '电池'
-  if (/(charger|charge)/.test(normalized)) return '充电'
-  if (/(pmic|power)/.test(normalized)) return '电源管理'
-  if (/(soc|tsens)/.test(normalized)) return 'SoC'
-  if (/(skin|shell|case)/.test(normalized)) return '外壳'
-  if (/(ambient|board)/.test(normalized)) return '环境'
-
-  const cpuRange = normalized.match(/cpu[^0-9]*(\d+)(?:[^0-9]+(\d+))?/)
-  if (cpuRange) {
-    return cpuRange[2] ? `CPU ${cpuRange[1]}-${cpuRange[2]}` : `CPU ${cpuRange[1]}`
-  }
-  if (normalized.includes('cpu')) return 'CPU'
-
-  const coreRange = normalized.match(/core[^0-9]*(\d+)(?:[^0-9]+(\d+))?/)
-  if (coreRange) {
-    return coreRange[2] ? `核心 ${coreRange[1]}-${coreRange[2]}` : `核心 ${coreRange[1]}`
-  }
-  if (normalized.includes('core')) return '核心'
-
-  const cleaned = source
-    .replace(/[-_\s]*(thermal|therm|temperature|temp|sensor|zone)[-_\s]*/gi, ' ')
-    .trim()
-
-  return cleaned || source
-}
-
-function formatTemperatureSource(sensor: ThermalZone | null) {
+function temperatureLabel(sensor: ThermalZone | null) {
   if (!sensor) return '-'
-  return `${getFriendlyTemperatureLabel(sensor)}: ${sensor.temperature.toFixed(1)}°`
+  return sensor.label?.trim() || sensor.type.trim() || sensor.zone
 }
 
 export function SystemResources({ systemStats }: SystemResourcesProps) {
   const theme = useTheme<Theme>()
   const rootDisk = systemStats?.disk?.find((disk) => disk.mount_point === '/') ?? systemStats?.disk?.[0]
-  const sortedTemperatureSensors = [...(systemStats?.temperature ?? [])]
+  const hottestSensor = [...(systemStats?.temperature ?? [])]
     .filter((sensor) => Number.isFinite(sensor.temperature))
-    .sort((a, b) => b.temperature - a.temperature)
-  const hottestSensor = sortedTemperatureSensors[0] ?? null
-  const coldestSensor = sortedTemperatureSensors.length > 0 ? sortedTemperatureSensors[sortedTemperatureSensors.length - 1] : null
-  const hottestPercent = hottestSensor ? getTempPercent(hottestSensor.temperature) : 0
-  const hottestColor = hottestSensor ? getTempBarColor(hottestSensor.temperature) : getTempBarColor(0)
-  const temperatureGradientSize = hottestPercent > 0 ? `${10000 / hottestPercent}% 100%` : '100% 100%'
+    .sort((a, b) => b.temperature - a.temperature)[0] ?? null
+  const hottestTemperaturePercent = hottestSensor ? getTempPercent(hottestSensor.temperature) : 0
+  const hottestTemperatureColor = hottestSensor ? getTempBarColor(hottestSensor.temperature) : theme.palette.action.disabled
 
   const progressSx = {
     height: 10,
@@ -121,19 +77,13 @@ export function SystemResources({ systemStats }: SystemResourcesProps) {
   const temperatureProgressSx = {
     ...progressSx,
     '& .MuiLinearProgress-bar': {
-      width: `${hottestPercent}%`,
-      backgroundImage: hottestSensor ? generateHeatmapGradient() : 'none',
-      backgroundSize: temperatureGradientSize,
-      backgroundPosition: 'left center',
-      bgcolor: hottestSensor ? getTempBarColor(0) : theme.palette.action.disabled,
+      backgroundColor: hottestTemperatureColor,
       borderRadius: 999,
-      transform: 'none !important',
-      boxShadow: hottestSensor ? `0 0 10px ${hottestColor}55` : 'none',
+      boxShadow: hottestSensor ? `0 0 10px ${hottestTemperatureColor}55` : 'none',
     },
   }
-
   return (
-    <Card sx={{ height: '100%' }}>
+    <Card sx={{ height: { xs: 'auto', md: 280 } }}>
       <CardContent>
         <Box display="flex" alignItems="center" justifyContent="space-between" mb={2}>
           <Box display="flex" alignItems="center" gap={1}>
@@ -222,49 +172,19 @@ export function SystemResources({ systemStats }: SystemResourcesProps) {
               <Box display="flex" justifyContent="space-between" alignItems="center" mb={0.75}>
                 <Box display="flex" alignItems="center" gap={0.75}>
                   <Thermostat fontSize="small" sx={{ color: 'text.secondary' }} />
-                  <Typography variant="caption" fontWeight={700}>最高温</Typography>
+                  <Typography variant="caption" fontWeight={700}>温度</Typography>
                 </Box>
-                <Typography variant="caption" fontFamily="monospace" fontWeight={700} sx={{ color: hottestSensor ? hottestColor : 'text.secondary' }}>
+                <Typography variant="caption" fontFamily="monospace" fontWeight={700} sx={{ color: hottestSensor ? hottestTemperatureColor : 'text.secondary' }}>
                   {hottestSensor ? `${hottestSensor.temperature.toFixed(1)}°C` : '-'}
                 </Typography>
               </Box>
-              <LinearProgress
-                variant="determinate"
-                value={hottestPercent}
-                sx={temperatureProgressSx}
-              />
-              <Box display="flex" alignItems="center" justifyContent="space-between" gap={1.5} mt={0.5}>
-                <Box display="flex" alignItems="center" gap={0.5} minWidth={0}>
-                  <Box
-                    sx={{
-                      width: 5,
-                      height: 5,
-                      borderRadius: '50%',
-                      bgcolor: getTempDotColor(coldestSensor),
-                      flex: '0 0 auto',
-                    }}
-                  />
-                  <Typography variant="caption" fontFamily="monospace" color="text.secondary" noWrap>
-                    {formatTemperatureSource(coldestSensor)}
-                  </Typography>
-                </Box>
-                <Box display="flex" alignItems="center" justifyContent="flex-end" gap={0.5} minWidth={0}>
-                  <Box
-                    sx={{
-                      width: 5,
-                      height: 5,
-                      borderRadius: '50%',
-                      bgcolor: getTempDotColor(hottestSensor),
-                      flex: '0 0 auto',
-                    }}
-                  />
-                  <Typography variant="caption" fontFamily="monospace" color="text.secondary" noWrap textAlign="right">
-                    {formatTemperatureSource(hottestSensor)}
-                  </Typography>
-                </Box>
-              </Box>
+              <LinearProgress variant="determinate" value={hottestTemperaturePercent} sx={temperatureProgressSx} />
+              <Typography variant="caption" color="text.disabled" sx={{ display: 'block', mt: 0.5, textAlign: 'right' }} noWrap>
+                {temperatureLabel(hottestSensor)}
+              </Typography>
             </Box>
           </Grid>
+
         </Grid>
       </CardContent>
     </Card>

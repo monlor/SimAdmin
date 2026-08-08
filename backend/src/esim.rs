@@ -23,6 +23,7 @@ use crate::models::{
 
 const ESIM_SHORT_TIMEOUT_SECS: u64 = 20;
 const ESIM_LONG_TIMEOUT_SECS: u64 = 60;
+const ESIM_PROFILE_ENABLE_TIMEOUT_SECS: u64 = 300;
 const ESIM_SWITCH_PREFLIGHT_TIMEOUT_SECS: u64 = 5;
 const LPAC_REPAIR_TIMEOUT_SECS: u64 = 120;
 const LPAC_PROBE_TIMEOUT_SECS: u64 = 3;
@@ -276,7 +277,7 @@ impl EsimSupervisor {
         self.call_lpac(
             "enable",
             &["profile", "enable", iccid.as_str(), refresh_flag],
-            ESIM_LONG_TIMEOUT_SECS,
+            ESIM_PROFILE_ENABLE_TIMEOUT_SECS,
         )
         .await
     }
@@ -1639,6 +1640,11 @@ mod tests {
         ]);
 
         assert_eq!(selected, Some(PathBuf::from("/dev/cdc-wdm0")));
+    }
+
+    #[test]
+    fn profile_enable_timeout_allows_full_switch_recovery_window() {
+        assert_eq!(ESIM_PROFILE_ENABLE_TIMEOUT_SECS, 300);
     }
 
     #[test]

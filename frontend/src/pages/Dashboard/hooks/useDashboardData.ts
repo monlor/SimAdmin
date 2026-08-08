@@ -85,6 +85,7 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
   const [connectivity, setConnectivity] = useState<ConnectivityResult | null>(null)
   const [connectionAddresses, setConnectionAddresses] = useState<ConnectionAddresses>({ ipv4: [], ipv6: [] })
   const [roaming, setRoaming] = useState<RoamingResponse | null>(null)
+  const [profileSwitching, setProfileSwitching] = useState(false)
   const [speedHistory, setSpeedHistory] = useState<Record<string, InterfaceSpeedHistory>>({})
   const speedHistoryRef = useRef<Record<string, InterfaceSpeedHistory>>({})
 
@@ -130,6 +131,14 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
     }
 
     try {
+      const profileSwitchStatus = await api.getProfileSwitchRecoveryStatus()
+      if (profileSwitchStatus.data?.running) {
+        setProfileSwitching(true)
+        setInitialLoading(false)
+        return
+      }
+      setProfileSwitching(false)
+
       // 快速请求：决定 initialLoading，通常 <200ms 即可全部返回
       const fastPromise = Promise.all([
         requestOrNull(api.getDeviceInfo(), 'device'),
@@ -262,8 +271,15 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
     }
   }, [refreshInterval, refreshKey, loadData])
 
+  useEffect(() => {
+    if (!profileSwitching) return
+    const interval = window.setInterval(() => void loadData(true), 2000)
+    return () => window.clearInterval(interval)
+  }, [profileSwitching, loadData])
+
   return {
     initialLoading,
+    profileSwitching,
     error,
     setError,
     data: {

@@ -58,6 +58,9 @@ const MODEM_RESTART_THRESHOLD: u32 = 5;
 const MODEM_RECOVERY_COOLDOWN_SECS: u64 = 300;
 const MODEM_DISCOVERY_TIMEOUT_SECS: u64 = 5;
 const MODEM_DISCOVERY_FAILURE_CACHE_SECS: u64 = 30;
+// eSIM Profile 切换会使 ModemManager 丢失设备对象；部分基带重新枚举需要较长时间。
+// Keep this aligned with the 5-minute profile-enable timeout exposed by the UI.
+const ESIM_PROFILE_SWITCH_MODEM_ENUMERATION_TIMEOUT_SECS: u64 = 300;
 const OPERATOR_SCAN_REQUEST_TIMEOUT_SECS: u64 = 45;
 const OPERATOR_SCAN_CACHE_POLL_SECS: u64 = 20;
 const NETWORK_REGISTER_TIMEOUT_SECS: u64 = 45;
@@ -2809,6 +2812,11 @@ LTE Timing Advance: 'unavailable'"#;
         // 实测数据: 中国移动/联通, record_length = 40 (0x28), 5 条记录
         let output = "+CRSM: 97,12,\"62198205422100280583026F428A01\"";
         assert_eq!(parse_crsm_fcp_record_length(output), 40);
+    }
+
+    #[test]
+    fn profile_switch_modem_enumeration_wait_matches_enable_timeout() {
+        assert_eq!(ESIM_PROFILE_SWITCH_MODEM_ENUMERATION_TIMEOUT_SECS, 300);
     }
 
     #[test]
@@ -6070,11 +6078,15 @@ async fn power_cycle_sim_for_profile_switch_inner(
         &mut steps,
         "等待基带重新枚举",
         "running",
-        Some("轮询等待 Modem 出现（最长 15 秒）".to_string()),
+        Some(format!(
+            "轮询等待 Modem 出现（最长 {} 秒）",
+            ESIM_PROFILE_SWITCH_MODEM_ENUMERATION_TIMEOUT_SECS
+        )),
     );
     // Poll for modem to reappear instead of a fixed 10s sleep
     let modem_path = {
-        let enum_deadline = Instant::now() + Duration::from_secs(15);
+        let enum_deadline = Instant::now()
+            + Duration::from_secs(ESIM_PROFILE_SWITCH_MODEM_ENUMERATION_TIMEOUT_SECS);
         let mut found_path = None;
         loop {
             match find_modem_path(conn).await {
@@ -6094,8 +6106,10 @@ async fn power_cycle_sim_for_profile_switch_inner(
                 path
             }
             None => {
-                let message =
-                    "等待基带重新枚举超时：ModemManager 启动后 15 秒内未检测到 Modem".to_string();
+                let message = format!(
+                    "等待基带重新枚举超时：ModemManager 启动后 {} 秒内未检测到 Modem",
+                    ESIM_PROFILE_SWITCH_MODEM_ENUMERATION_TIMEOUT_SECS
+                );
                 record_baseband_step(
                     &mut steps,
                     "等待基带重新枚举",

@@ -4,7 +4,6 @@ import {
   CheckCircle,
   FlightTakeoff,
   SignalCellularAlt,
-  TimerOutlined,
   WifiTethering,
 } from '@mui/icons-material'
 import { useRefreshInterval } from '@/contexts/RefreshContext'
@@ -13,10 +12,12 @@ import { getCarrierLogo, formatCarrierName } from '@/utils/carriers'
 import {
   QuickControls,
   SystemResources,
-  NetworkSpeed,
   SimCardInfo,
-  TemperatureMonitor,
+  RecentSms,
+  OperatorManagement,
+  NotificationLogs,
   DeviceInfoCard,
+  EsimProfileSwitcher,
 } from './components'
 import { useDashboardData, type DashboardData } from './hooks/useDashboardData'
 
@@ -34,24 +35,16 @@ function getRegistrationLabel(status?: string) {
   return status || '未知'
 }
 
-function latencyLabel(value?: number) {
-  return typeof value === 'number' ? `${value.toFixed(0)}ms` : '-'
-}
-
-function StatusBar({ data }: { data: DashboardData }) {
+function StatusBar({ data, onError, onEsimSwitched }: {
+  data: DashboardData
+  onError: (message: string) => void
+  onEsimSwitched: () => void
+}) {
   const signal = data.networkInfo?.signal_strength ?? 0
   const networkTech = getNetworkTech(data)
   const carrierLogo = getCarrierLogo(data.networkInfo?.mcc, data.networkInfo?.mnc)
   const carrierName = formatCarrierName(data.networkInfo?.mcc, data.networkInfo?.mnc)
   const isAirplaneMode = data.airplaneMode?.enabled ?? false
-  const ipValueSx = {
-    minWidth: 0,
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    fontSize: '0.75rem',
-  } as const
-  const ipLabelSx = { ...ipValueSx, flexShrink: 0 } as const
-
   return (
     <Paper
       elevation={0}
@@ -128,39 +121,14 @@ function StatusBar({ data }: { data: DashboardData }) {
         </Typography>
       </Stack>
 
-      <Stack spacing={0.75} sx={{ minWidth: { xs: '100%', md: 360 }, ml: { md: 'auto' } }}>
-        <Box display="flex" alignItems="center" justifyContent="flex-end" gap={1}>
-          <Typography variant="body2" sx={ipLabelSx}>IPv4：</Typography>
-          <Typography variant="body2" sx={ipValueSx}>
-            {data.connectionAddresses.ipv4[0] || '-'}
-          </Typography>
-          <Box display="flex" alignItems="center" gap={0.35} color={data.connectivity?.ipv4?.success ? 'success.main' : 'text.disabled'}>
-            <TimerOutlined sx={{ fontSize: 14 }} />
-            <Typography variant="caption" fontFamily="monospace" fontWeight={700}>
-              {latencyLabel(data.connectivity?.ipv4?.latency_ms)}
-            </Typography>
-          </Box>
-        </Box>
-        <Box display="flex" alignItems="center" justifyContent="flex-end" gap={1}>
-          <Typography variant="body2" sx={ipLabelSx}>IPv6：</Typography>
-          <Typography variant="body2" sx={ipValueSx}>
-            {data.connectionAddresses.ipv6[0] || '-'}
-          </Typography>
-          <Box display="flex" alignItems="center" gap={0.35} color={data.connectivity?.ipv6?.success ? 'success.main' : 'text.disabled'}>
-            <TimerOutlined sx={{ fontSize: 14 }} />
-            <Typography variant="caption" fontFamily="monospace" fontWeight={700}>
-              {latencyLabel(data.connectivity?.ipv6?.latency_ms)}
-            </Typography>
-          </Box>
-        </Box>
-      </Stack>
+      <EsimProfileSwitcher onError={onError} onSwitched={onEsimSwitched} />
     </Paper>
   )
 }
 
 export default function DashboardPage() {
   const { refreshInterval, refreshKey } = useRefreshInterval()
-  const { initialLoading, error, setError, data, actions } = useDashboardData(refreshInterval, refreshKey)
+  const { initialLoading, profileSwitching, error, setError, data, actions } = useDashboardData(refreshInterval, refreshKey)
 
   if (initialLoading) {
     return (
@@ -170,12 +138,26 @@ export default function DashboardPage() {
     )
   }
 
+  if (profileSwitching) {
+    return (
+      <Box display="flex" flexDirection="column" justifyContent="center" alignItems="center" gap={2} minHeight="60vh">
+        <CircularProgress />
+        <Typography variant="h6">SIM 切换中</Typography>
+        <Typography color="text.secondary">正在切换 Profile 并恢复基带与网络，请稍候</Typography>
+      </Box>
+    )
+  }
+
   return (
     <Box sx={{ maxWidth: 1600, mx: 'auto' }}>
       <ErrorSnackbar error={error} onClose={() => setError(null)} />
 
       <Stack spacing={2}>
-        <StatusBar data={data} />
+        <StatusBar
+          data={data}
+          onError={setError}
+          onEsimSwitched={() => window.setTimeout(() => void actions.loadData(), 1_000)}
+        />
 
         <Grid container spacing={2}>
           <Grid size={{ xs: 12, md: 6, lg: 3 }}>
@@ -194,19 +176,23 @@ export default function DashboardPage() {
           </Grid>
 
           <Grid size={{ xs: 12, lg: 6 }}>
-            <SystemResources systemStats={data.systemStats} />
+            <RecentSms refreshInterval={refreshInterval} refreshKey={refreshKey} />
           </Grid>
 
-          <Grid size={{ xs: 12, lg: 8 }}>
-            <NetworkSpeed systemStats={data.systemStats} speedHistory={data.speedHistory} />
+          <Grid size={{ xs: 12, lg: 6 }}>
+            <OperatorManagement refreshInterval={refreshInterval} refreshKey={refreshKey} />
           </Grid>
 
-          <Grid size={{ xs: 12, lg: 4 }}>
-            <TemperatureMonitor systemStats={data.systemStats} />
-          </Grid>
-
-          <Grid size={12}>
+          <Grid size={{ xs: 12, lg: 6 }}>
             <DeviceInfoCard deviceInfo={data.deviceInfo} systemStats={data.systemStats} />
+          </Grid>
+
+          <Grid size={{ xs: 12, lg: 6 }}>
+            <NotificationLogs refreshInterval={refreshInterval} refreshKey={refreshKey} />
+          </Grid>
+
+          <Grid size={{ xs: 12, lg: 6 }}>
+            <SystemResources systemStats={data.systemStats} />
           </Grid>
         </Grid>
       </Stack>

@@ -53,6 +53,16 @@ export interface EsimCommandResponse {
   data?: unknown
 }
 
+export interface ProfileSwitchRecoveryStatus {
+  operation_id: string
+  profile_iccid: string
+  phase: 'switching' | 'recovering' | 'completed' | 'failed'
+  steps: BasebandRestartStep[]
+  running: boolean
+  current_registration?: string
+  error?: string
+}
+
 export interface EsimEuiccInfo {
   eid: string
   status: string
