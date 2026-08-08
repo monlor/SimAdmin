@@ -79,6 +79,7 @@ const MODEM_HELPER_COMMAND_TIMEOUT_SECS: u64 = 3;
 const MODEM_AT_COMMAND_TIMEOUT_SECS: u64 = 2;
 const SMSC_HELPER_FALLBACK_TIMEOUT_SECS: u64 = 4;
 const SMSC_BACKGROUND_AT_TIMEOUT_SECS: u64 = 10;
+const MM_SMS_STATE_SENT: u32 = 5;
 
 #[allow(dead_code)]
 static SMSC_BACKGROUND_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -760,8 +761,6 @@ fn own_number_identity_key(identity: &SimIdentity) -> Option<String> {
     }
 }
 
-
-
 pub fn cache_smsc_for_identity(
     db: &Database,
     identity: &SimIdentity,
@@ -834,8 +833,6 @@ pub fn cached_own_numbers_for_identity(db: &Database, identity: &SimIdentity) ->
         .map(|entry| normalize_phone_numbers(entry.phone_numbers))
         .unwrap_or_default()
 }
-
-
 
 pub fn sim_details_cache_missing(db: &Database, identity: &SimIdentity) -> bool {
     if identity.iccid.is_empty() {
@@ -1839,8 +1836,6 @@ async fn refresh_sim_details_background_inner(conn: &Connection, db: &Database, 
         }
         cache_smsc_for_identity(db, &identity, &sms_center, source);
     }
-
-
 }
 
 async fn modem_command_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
@@ -1897,9 +1892,6 @@ async fn active_protocol_smsc_fallback(conn: &Connection, modem_path: &str) -> S
     .await
     .unwrap_or_default()
 }
-
-
-
 
 pub async fn get_sim_info_data_with_cache(
     conn: &Connection,
@@ -2055,8 +2047,6 @@ pub async fn get_sim_info_data_with_cache(
         .get("CarrierConfigurationRevision")
         .map(extract_string)
         .unwrap_or_default();
-
-
 
     Ok(SimInfoResponse {
         present: true,
@@ -2641,8 +2631,6 @@ LTE Timing Advance: 'unavailable'"#;
         assert_eq!(parse_smsc_from_at_output(output), "+10000");
     }
 
-
-
     #[test]
     fn extracts_smsc_from_protocol_output() {
         let output = "SMSC Address\n  Type: 'international'\n  Number: '+10001'";
@@ -2951,8 +2939,6 @@ LTE Timing Advance: 'unavailable'"#;
             vec!["LTE B8".to_string(), "NR n78".to_string()]
         );
     }
-
-
 
     fn apn_ctx(
         path: &str,
@@ -3996,6 +3982,35 @@ async fn wait_for_registered_network(
 
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+}
+
+/// Wait until the modem is registered on a usable network. Unlike the
+/// baseband-recovery helper above, this returns registration failure to the
+/// caller so operations such as automation SMS can refuse to send too early.
+pub async fn wait_for_registered_network_ready(
+    conn: &Connection,
+    timeout: Duration,
+) -> Result<String, String> {
+    with_serial(async {
+        let modem_path = find_modem_path(conn)
+            .await
+            .map_err(|err| format!("查找 Modem 失败：{err}"))?;
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            let current_summary = match registration_snapshot(conn, &modem_path).await {
+                Ok((true, summary)) => return Ok(summary),
+                Ok((false, summary)) => summary,
+                Err(err) => format!("读取注册状态失败：{err}"),
+            };
+
+            if Instant::now() >= deadline {
+                return Err(format!("等待网络注册超时，最后状态：{current_summary}"));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    })
+    .await
 }
 
 async fn simple_connect_for_baseband_restart(
@@ -5522,20 +5537,67 @@ pub async fn send_sms(
     content: &str,
 ) -> zbus::Result<String> {
     with_serial(async {
-        let modem_path = find_modem_path(conn).await?;
-        let proxy = Proxy::new(conn, MM_SERVICE, modem_path.as_str(), MM_MESSAGING).await?;
-
-        let mut sms_props: HashMap<String, Value<'_>> = HashMap::new();
-        sms_props.insert("number".to_string(), Value::new(phone_number));
-        sms_props.insert("text".to_string(), Value::new(content));
-
-        let sms_path: OwnedObjectPath = proxy.call("Create", &(sms_props,)).await?;
-        let sms_proxy = Proxy::new(conn, MM_SERVICE, &sms_path, MM_SMS).await?;
-        sms_proxy.call::<_, _, ()>("Send", &()).await?;
+        let (modem_path, sms_path) = create_and_queue_sms(conn, phone_number, content).await?;
 
         info!(path = %sms_path, "SMS sent successfully");
         schedule_sent_sms_delete(conn, modem_path.as_str(), sms_path.clone());
         Ok(sms_path.to_string())
+    })
+    .await
+}
+
+async fn create_and_queue_sms(
+    conn: &Connection,
+    phone_number: &str,
+    content: &str,
+) -> zbus::Result<(String, OwnedObjectPath)> {
+    let modem_path = find_modem_path(conn).await?;
+    let proxy = Proxy::new(conn, MM_SERVICE, modem_path.as_str(), MM_MESSAGING).await?;
+
+    let mut sms_props: HashMap<String, Value<'_>> = HashMap::new();
+    sms_props.insert("number".to_string(), Value::new(phone_number));
+    sms_props.insert("text".to_string(), Value::new(content));
+
+    let sms_path: OwnedObjectPath = proxy.call("Create", &(sms_props,)).await?;
+    let sms_proxy = Proxy::new(conn, MM_SERVICE, &sms_path, MM_SMS).await?;
+    sms_proxy.call::<_, _, ()>("Send", &()).await?;
+    Ok((modem_path, sms_path))
+}
+
+/// Queue an SMS and wait for ModemManager to report `MM_SMS_STATE_SENT`.
+/// `Send()` itself only guarantees that the message was queued for delivery.
+pub async fn send_sms_confirmed(
+    conn: &Connection,
+    phone_number: &str,
+    content: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    with_serial(async {
+        let (modem_path, sms_path) = create_and_queue_sms(conn, phone_number, content)
+            .await
+            .map_err(|err| format!("短信提交失败：{err}"))?;
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            let detail = match get_property(conn, sms_path.as_str(), MM_SMS, "State").await {
+                Ok(value) => {
+                    let state = extract_u32(&value);
+                    if state == MM_SMS_STATE_SENT {
+                        info!(path = %sms_path, "SMS confirmed sent by ModemManager");
+                        schedule_sent_sms_delete(conn, modem_path.as_str(), sms_path.clone());
+                        return Ok(sms_path.to_string());
+                    }
+                    format!("最后短信状态：{state}")
+                }
+                Err(err) => format!("最后状态读取失败：{err}"),
+            };
+
+            if Instant::now() >= deadline {
+                schedule_sent_sms_delete(conn, modem_path.as_str(), sms_path.clone());
+                return Err(format!("等待短信发送确认超时，{detail}"));
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     })
     .await
 }

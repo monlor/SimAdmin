@@ -92,30 +92,9 @@ export default function AutomationTaskCard({
       return `${nextDate.getFullYear()}-${pad(nextDate.getMonth() + 1)}-${pad(nextDate.getDate())} ${pad(nextDate.getHours())}:${pad(nextDate.getMinutes())}`
     } else {
       // Interval
-      const val = task.trigger.config.interval_value
-      const unit = task.trigger.config.interval_unit
-
-      if (!latestLog) return '无运行历史，即将触发'
-
-      // Parse last run time
-      // Expected format: YYYY-MM-DD HH:MM:SS
-      const parts = latestLog.created_at.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/)
-      if (!parts) return '无运行历史，即将触发'
-
-      const lastRunDate = new Date(
-        parseInt(parts[1], 10),
-        parseInt(parts[2], 10) - 1,
-        parseInt(parts[3], 10),
-        parseInt(parts[4], 10),
-        parseInt(parts[5], 10),
-        parseInt(parts[6], 10)
-      )
-
-      let multiplier = 60 * 1000
-      if (unit === 'hours') multiplier = 60 * 60 * 1000
-      else if (unit === 'days') multiplier = 24 * 60 * 60 * 1000
-      const nextTime = lastRunDate.getTime() + val * multiplier
-      const nextDate = new Date(nextTime)
+      if (!task.next_run_at) return '等待计算下次执行时间'
+      const nextDate = new Date(task.next_run_at)
+      if (Number.isNaN(nextDate.getTime())) return '下次执行时间无效'
 
       const pad = (n: number) => n.toString().padStart(2, '0')
       return `${nextDate.getFullYear()}-${pad(nextDate.getMonth() + 1)}-${pad(nextDate.getDate())} ${pad(nextDate.getHours())}:${pad(nextDate.getMinutes())}`
@@ -123,6 +102,11 @@ export default function AutomationTaskCard({
   }
 
   const nextRun = getNextRunDisplay()
+  const latestDetail = latestLog?.detail
+    .split('\n')
+    .filter((line) => line.trim().length > 0)
+    .at(-1) ?? ''
+  const isRunning = latestLog?.status === 'running'
 
   return (
     <Card sx={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
@@ -202,6 +186,14 @@ export default function AutomationTaskCard({
           {task.action.type === 'send_sms' && (
             <>
               <Box display="flex" justifyContent="space-between" mb={0.75}>
+                <Typography variant="body2" color="text.secondary">发送号码:</Typography>
+                <Typography variant="body2">
+                  {task.action.config.source_iccid
+                    ? `eSIM · ••••${task.action.config.source_iccid.slice(-6)}`
+                    : '当前已启用号码'}
+                </Typography>
+              </Box>
+              <Box display="flex" justifyContent="space-between" mb={0.75}>
                 <Typography variant="body2" color="text.secondary">接收号码:</Typography>
                 <Typography variant="body2">
                   {task.action.config.phone_number}
@@ -278,13 +270,19 @@ export default function AutomationTaskCard({
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, minWidth: 0, flexGrow: 1 }}>
             {latestLog ? (
               <>
-                {latestLog.status === 'success' ? (
+                {latestLog.status === 'running' ? (
+                  <CircularProgress color="warning" size={16} sx={{ flexShrink: 0 }} />
+                ) : latestLog.status === 'success' ? (
                   <CheckCircle color="success" sx={{ fontSize: 16, flexShrink: 0 }} />
                 ) : (
                   <ErrorIcon color="error" sx={{ fontSize: 16, flexShrink: 0 }} />
                 )}
                 <Typography variant="caption" color="text.secondary" noWrap sx={{ maxWidth: 140 }} title={latestLog.detail}>
-                  {latestLog.status === 'success' ? '上次成功' : `失败: ${latestLog.detail}`}
+                  {latestLog.status === 'running'
+                    ? `执行中: ${latestDetail}`
+                    : latestLog.status === 'success'
+                      ? '上次成功'
+                      : `失败: ${latestDetail}`}
                 </Typography>
               </>
             ) : (
@@ -299,10 +297,10 @@ export default function AutomationTaskCard({
               size="small"
               color="primary"
               title="立即执行"
-              disabled={testingTaskId === task.id}
+              disabled={testingTaskId === task.id || isRunning}
               onClick={() => onTest(task.id)}
             >
-              {testingTaskId === task.id ? <CircularProgress size={18} /> : <PlayArrow />}
+              {testingTaskId === task.id || isRunning ? <CircularProgress size={18} /> : <PlayArrow />}
             </IconButton>
             <IconButton
               size="small"

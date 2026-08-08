@@ -460,7 +460,7 @@ fn live_refresh_requested(query: &std::collections::HashMap<String, String>) -> 
         .unwrap_or(false)
 }
 
-enum EsimProfileEnableOutcome {
+pub(crate) enum EsimProfileEnableOutcome {
     Enabled(EsimCommandResponse),
     AlreadyEnabled(EsimCommandResponse),
     Failed(EsimCommandResponse),
@@ -557,7 +557,7 @@ async fn retry_enable_profile_after_refresh(
     }
 }
 
-async fn enable_esim_profile_for_switch(
+pub(crate) async fn enable_esim_profile_for_switch(
     app: &AppState,
     iccid: &str,
 ) -> Result<EsimProfileEnableOutcome, EsimApiError> {
@@ -948,6 +948,9 @@ pub async fn enable_esim_profile_handler(
     State(app): State<AppState>,
     Path(iccid): Path<String>,
 ) -> impl IntoResponse {
+    // Keep the Profile command and its modem recovery atomic with respect to
+    // temporary-Profile automation SMS transactions.
+    let profile_switch_guard = app.esim_profile_switch_lock.clone().lock_owned().await;
     let event_entity = mask_identifier(&iccid);
     let operation_id = start_profile_switch(&iccid);
 
@@ -1015,6 +1018,7 @@ pub async fn enable_esim_profile_handler(
     let bg_app = app.clone();
     let bg_event_entity = event_entity.clone();
     tokio::spawn(async move {
+        let _profile_switch_guard = profile_switch_guard;
         let _guard = modem_manager::BasebandRestartRunGuard::new();
         let auto_connect_data = !bg_app.data_user_disabled.load(Ordering::SeqCst);
         let allow_roaming = bg_app.config_manager.get_roaming_allowed();
@@ -4439,86 +4443,28 @@ pub async fn test_automation_task_handler(
         return (StatusCode::OK, Json(ApiResponse::error("自动化任务不存在")));
     };
 
+    let Some(run_guard) = app_state.automation_task_runs.try_start(&task.id) else {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::error("任务正在执行，请勿重复触发")),
+        );
+    };
+    if let Err(err) = app_state
+        .config_manager
+        .mark_automation_task_triggered(&task.id)
+    {
+        warn!(task_id = %task.id, error = %err, "Failed to persist next automation run time");
+    }
+
     tokio::spawn(async move {
+        let _run_guard = run_guard;
         let registry = crate::automation::tasks::TaskRegistry::new();
-        let task_type = match &task.action {
-            crate::config::AutomationAction::RestartBaseband => "restart_baseband",
-            crate::config::AutomationAction::RebootDevice { .. } => "reboot_device",
-            crate::config::AutomationAction::BackupData { .. } => "backup_data",
-            crate::config::AutomationAction::SendSms { .. } => "send_sms",
-        };
-
-        let handler = match registry.get(task_type) {
-            Some(h) => h,
-            None => {
-                let err_msg = format!("未找到该任务类型的处理器: {}", task_type);
-                let _ = app_state
-                    .database
-                    .insert_automation_log(&task.id, &task.name, task_type, "failed", &err_msg);
-                return;
-            }
-        };
-
-        let mut delay_secs = 0u64;
-        let params = match &task.action {
-            crate::config::AutomationAction::RestartBaseband => serde_json::Value::Null,
-            crate::config::AutomationAction::RebootDevice { delay_seconds } => {
-                serde_json::json!({ "delay_seconds": delay_seconds })
-            }
-            crate::config::AutomationAction::BackupData {
-                components,
-                storage,
-            } => {
-                serde_json::json!({
-                    "components": components,
-                    "storage": storage,
-                })
-            }
-            crate::config::AutomationAction::SendSms {
-                phone_number,
-                content,
-                random_delay_seconds,
-                retry_limit,
-            } => {
-                delay_secs = u64::from(random_delay_seconds.unwrap_or(0));
-                serde_json::json!({
-                    "phone_number": phone_number,
-                    "content": content,
-                    "random_delay_seconds": random_delay_seconds,
-                    "retry_limit": retry_limit
-                })
-            }
-        };
-
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(60 + delay_secs),
-            handler.execute(&app_state, &params),
-        )
-        .await;
-
-        let (status, detail) = match result {
-            Ok(Ok(_)) => ("success", "执行成功".to_string()),
-            Ok(Err(e)) => ("failed", format!("执行失败: {}", e)),
-            Err(_) => ("failed", "执行超时 (超过60秒限制)".to_string()),
-        };
-
-        let _ = app_state
-            .database
-            .insert_automation_log(&task.id, &task.name, task_type, status, &detail);
-
-        let event = crate::notification::AutomationEvent {
-            task_id: task.id.clone(),
-            task_name: task.name.clone(),
-            task_type: task_type.to_string(),
-            status: status.to_string(),
-            message: detail.clone(),
-            timestamp: crate::db::beijing_sms_now_string(),
-        };
-
-        let _ = app_state
-            .notification_sender
-            .forward_automation_event(&event)
-            .await;
+        if let Err(err) =
+            crate::automation::scheduler::execute_task(&app_state, &registry, &task, "手动执行")
+                .await
+        {
+            warn!(task_id = %task.id, error = %err, "Manual automation task failed");
+        }
     });
 
     (

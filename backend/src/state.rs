@@ -2,9 +2,9 @@
 //! 统一管理应用的共享状态
 
 use axum::extract::FromRef;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 use tokio::sync::Mutex;
 use zbus::Connection;
@@ -25,6 +25,47 @@ pub struct ActiveCallRecord {
     pub answered: bool,
 }
 
+/// Tracks automation tasks that are currently executing across scheduler and
+/// manual-trigger entry points. The returned guard releases the task ID even
+/// when the spawned future is cancelled or unwinds.
+#[derive(Clone, Default)]
+pub struct AutomationTaskRunTracker {
+    running: Arc<StdMutex<HashSet<String>>>,
+}
+
+pub struct AutomationTaskRunGuard {
+    task_id: String,
+    tracker: AutomationTaskRunTracker,
+}
+
+impl AutomationTaskRunTracker {
+    pub fn try_start(&self, task_id: &str) -> Option<AutomationTaskRunGuard> {
+        let mut running = self
+            .running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !running.insert(task_id.to_string()) {
+            return None;
+        }
+        drop(running);
+
+        Some(AutomationTaskRunGuard {
+            task_id: task_id.to_string(),
+            tracker: self.clone(),
+        })
+    }
+}
+
+impl Drop for AutomationTaskRunGuard {
+    fn drop(&mut self) {
+        self.tracker
+            .running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.task_id);
+    }
+}
+
 /// 应用全局状态
 ///
 /// 统一管理所有共享资源，避免在路由中多次调用 `.with_state()`
@@ -41,6 +82,12 @@ pub struct AppState {
     pub system_event_emitter: Arc<SystemEventEmitter>,
     pub ddns_manager: Arc<DdnsManager>,
     pub esim_supervisor: Arc<EsimSupervisor>,
+    /// Serialize complete eSIM profile switch transactions, including modem
+    /// recovery and any temporary-profile SMS operation that must switch back.
+    pub esim_profile_switch_lock: Arc<Mutex<()>>,
+    /// Prevent the same automation task from being started again before its
+    /// current run (including random delay and eSIM restoration) has finished.
+    pub automation_task_runs: AutomationTaskRunTracker,
     pub sms_resync: SmsResyncHandle,
     pub sms_db_maintenance_pending: Arc<AtomicBool>,
     pub active_calls: Arc<Mutex<HashMap<String, ActiveCallRecord>>>,
@@ -76,6 +123,8 @@ impl AppState {
             system_event_emitter,
             ddns_manager,
             esim_supervisor,
+            esim_profile_switch_lock: Arc::new(Mutex::new(())),
+            automation_task_runs: AutomationTaskRunTracker::default(),
             sms_resync,
             sms_db_maintenance_pending: Arc::new(AtomicBool::new(false)),
             active_calls: Arc::new(Mutex::new(HashMap::new())),
@@ -84,6 +133,23 @@ impl AppState {
             airplane_mode_requested,
             cell_monitoring_active,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AutomationTaskRunTracker;
+
+    #[test]
+    fn automation_task_tracker_rejects_overlap_and_releases_on_drop() {
+        let tracker = AutomationTaskRunTracker::default();
+        let guard = tracker.try_start("task-1").expect("first run starts");
+
+        assert!(tracker.try_start("task-1").is_none());
+        assert!(tracker.try_start("task-2").is_some());
+
+        drop(guard);
+        assert!(tracker.try_start("task-1").is_some());
     }
 }
 

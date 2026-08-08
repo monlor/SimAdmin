@@ -1088,6 +1088,7 @@ export type AutomationAction =
       config: {
         phone_number: string
         content: string
+        source_iccid?: string
         random_delay_seconds?: number
         retry_limit?: number
       }
@@ -1097,6 +1098,7 @@ export interface AutomationTask {
   id: string
   name: string
   enabled: boolean
+  next_run_at?: string
   trigger: AutomationTrigger
   action: AutomationAction
 }
@@ -1106,7 +1108,7 @@ export interface AutomationLogEntry {
   task_id: string
   task_name: string
   task_type: string
-  status: string
+  status: 'running' | 'success' | 'failed'
   detail: string
   created_at: string
 }

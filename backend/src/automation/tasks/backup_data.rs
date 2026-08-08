@@ -1,3 +1,4 @@
+use crate::automation::execution_log;
 use crate::automation::traits::AutomationTaskHandler;
 use crate::config::BackupStorageConfig;
 use crate::state::AppState;
@@ -26,17 +27,30 @@ impl AutomationTaskHandler for BackupDataHandler {
         params: &'a serde_json::Value,
     ) -> BoxFuture<'a, Result<()>> {
         async move {
-            let params: BackupDataParams =
+            let task_params: BackupDataParams =
                 serde_json::from_value(params.clone()).context("解析备份任务参数失败")?;
+
+            execution_log::append(
+                app,
+                params,
+                format!(
+                    "开始备份 {} 个组件到 {}",
+                    task_params.components.len(),
+                    task_params.storage.local_dir
+                ),
+            );
 
             crate::backup::write_automation_backup(
                 app,
-                &params.components,
-                &params.storage.local_dir,
+                &task_params.components,
+                &task_params.storage.local_dir,
             )
             .map(|_| ())
             .map_err(|err| anyhow::anyhow!(err))
-            .context("执行备份数据任务失败")
+            .context("执行备份数据任务失败")?;
+
+            execution_log::append(app, params, "备份数据已完成");
+            Ok(())
         }
         .boxed()
     }

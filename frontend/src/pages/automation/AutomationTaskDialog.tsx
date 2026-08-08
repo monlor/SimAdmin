@@ -17,11 +17,13 @@ import {
   Typography,
 } from '@mui/material'
 import BackupStorageSelector, { type BackupDestination } from '../../components/backup/BackupStorageSelector'
+import { api } from '../../api'
 import type {
   AutomationTask,
   AutomationAction,
   AutomationTrigger,
   BackupComponentKey,
+  EsimProfile,
 } from '../../api/contracts'
 
 type AutomationTaskDialogProps = {
@@ -70,6 +72,27 @@ const LOG_COMPONENTS: BackupComponentKey[] = [
   'automation_logs',
 ]
 
+const profileIsActive = (profile: EsimProfile) =>
+  ['enabled', 'active', '1', 'true'].includes(profile.state.trim().toLowerCase())
+
+const maskIccid = (iccid: string) => {
+  const value = iccid.trim()
+  return value.length > 6 ? `••••${value.slice(-6)}` : value
+}
+
+const profileSourceLabel = (profile: EsimProfile) => {
+  const number = profile.msisdn?.trim()
+  const identity = [profile.name, profile.provider]
+    .map((value) => value?.trim())
+    .filter(Boolean)
+    .join(' · ')
+  const parts = [number || identity || '未读取到号码']
+  if (number && identity) parts.push(identity)
+  parts.push(`ICCID ${maskIccid(profile.iccid)}`)
+  if (profileIsActive(profile)) parts.push('当前')
+  return parts.join(' · ')
+}
+
 
 export default function AutomationTaskDialog({
   open,
@@ -84,8 +107,12 @@ export default function AutomationTaskDialog({
   const [formRebootDelay, setFormRebootDelay] = useState(5)
   const [formSmsPhone, setFormSmsPhone] = useState('')
   const [formSmsContent, setFormSmsContent] = useState('')
+  const [formSmsSourceIccid, setFormSmsSourceIccid] = useState('')
   const [formSmsDelay, setFormSmsDelay] = useState(120)
   const [formSmsRetries, setFormSmsRetries] = useState(3)
+  const [esimProfiles, setEsimProfiles] = useState<EsimProfile[]>([])
+  const [esimProfilesLoading, setEsimProfilesLoading] = useState(false)
+  const [esimProfilesError, setEsimProfilesError] = useState<string | null>(null)
   const [formBackupComponents, setFormBackupComponents] = useState<BackupComponentKey[]>(DEFAULT_BACKUP_COMPONENTS)
   const [formBackupLocalDir, setFormBackupLocalDir] = useState(defaultBackupLocalDir)
   const [formBackupDestination, setFormBackupDestination] = useState<BackupDestination>('local')
@@ -111,6 +138,7 @@ export default function AutomationTaskDialog({
         setFormBackupComponents(DEFAULT_BACKUP_COMPONENTS)
         setFormBackupLocalDir(defaultBackupLocalDir)
         setFormBackupDestination('local')
+        setFormSmsSourceIccid('')
         if (editingTask.action.type === 'reboot_device') {
           setFormRebootDelay(editingTask.action.config.delay_seconds)
         } else if (editingTask.action.type === 'backup_data') {
@@ -122,6 +150,7 @@ export default function AutomationTaskDialog({
         } else if (editingTask.action.type === 'send_sms') {
           setFormSmsPhone(editingTask.action.config.phone_number)
           setFormSmsContent(editingTask.action.config.content)
+          setFormSmsSourceIccid(editingTask.action.config.source_iccid ?? '')
           setFormSmsDelay(editingTask.action.config.random_delay_seconds ?? 0)
           setFormSmsRetries(editingTask.action.config.retry_limit ?? 0)
         }
@@ -140,6 +169,7 @@ export default function AutomationTaskDialog({
         setFormRebootDelay(5)
         setFormSmsPhone('')
         setFormSmsContent('')
+        setFormSmsSourceIccid('')
         setFormSmsDelay(120)
         setFormSmsRetries(3)
         setFormBackupComponents(DEFAULT_BACKUP_COMPONENTS)
@@ -153,6 +183,32 @@ export default function AutomationTaskDialog({
       }
     }
   }, [open, editingTask, defaultBackupLocalDir])
+
+  useEffect(() => {
+    if (!open || formActionType !== 'send_sms') return
+    let cancelled = false
+
+    const loadProfiles = async () => {
+      setEsimProfilesLoading(true)
+      setEsimProfilesError(null)
+      setEsimProfiles([])
+      try {
+        // A live listing prevents a stale cached Profile from being saved as
+        // the temporary SMS source after an eUICC replacement or deletion.
+        const response = await api.getEsimProfiles()
+        if (!cancelled) setEsimProfiles(response.data?.profiles ?? [])
+      } catch (err) {
+        if (!cancelled) {
+          setEsimProfilesError(err instanceof Error ? err.message : '读取 eSIM 号码失败')
+        }
+      } finally {
+        if (!cancelled) setEsimProfilesLoading(false)
+      }
+    }
+
+    void loadProfiles()
+    return () => { cancelled = true }
+  }, [open, formActionType])
 
   const insertVariable = (token: string) => {
     const el = smsContentRef.current
@@ -219,6 +275,7 @@ export default function AutomationTaskDialog({
         config: {
           phone_number: phoneClean,
           content: formSmsContent,
+          source_iccid: formSmsSourceIccid || undefined,
           random_delay_seconds: Number(formSmsDelay) || 0,
           retry_limit: Number(formSmsRetries) || 0,
         },
@@ -398,6 +455,32 @@ export default function AutomationTaskDialog({
           {formActionType === 'send_sms' && (
             <Box display="flex" flexDirection="column" gap={2.5}>
               <TextField
+                select
+                label="发送号码"
+                fullWidth
+                value={formSmsSourceIccid}
+                onChange={(e) => setFormSmsSourceIccid(e.target.value)}
+                slotProps={{ select: { displayEmpty: true } }}
+                helperText={esimProfilesLoading
+                  ? '正在读取 eSIM Profile…'
+                  : esimProfilesError
+                    ? `未能刷新 eSIM 号码：${esimProfilesError}`
+                    : '选择 eSIM 后会自动切换，驻网并稳定等待 10 秒；发送完成后自动切回原号码。'}
+              >
+                <MenuItem value="">当前已启用号码（不切换）</MenuItem>
+                {formSmsSourceIccid && !esimProfiles.some((profile) => profile.iccid === formSmsSourceIccid) && (
+                  <MenuItem value={formSmsSourceIccid}>
+                    已配置 eSIM · ICCID {maskIccid(formSmsSourceIccid)}
+                  </MenuItem>
+                )}
+                {esimProfiles.map((profile) => (
+                  <MenuItem key={profile.iccid} value={profile.iccid}>
+                    {profileSourceLabel(profile)}
+                  </MenuItem>
+                ))}
+              </TextField>
+
+              <TextField
                 label="接收号码"
                 placeholder="如：10010 或其他号码"
                 fullWidth
@@ -538,23 +621,28 @@ export default function AutomationTaskDialog({
 
           {/* 时间间隔配置 */}
           {formTriggerType === 'interval' && (
-            <Box display="grid" gridTemplateColumns="1fr 1fr" gap={2}>
-              <TextField
-                label="间隔时长"
-                type="number"
-                value={formIntervalVal}
-                onChange={(e) => setFormIntervalVal(Math.max(1, parseInt(e.target.value, 10) || 1))}
-              />
-              <TextField
-                select
-                label="时间单位"
-                value={formIntervalUnit}
-                onChange={(e) => setFormIntervalUnit(e.target.value)}
-              >
-                <MenuItem value="mins">分钟</MenuItem>
-                <MenuItem value="hours">小时</MenuItem>
-                <MenuItem value="days">天</MenuItem>
-              </TextField>
+            <Box display="flex" flexDirection="column" gap={1}>
+              <Box display="grid" gridTemplateColumns="1fr 1fr" gap={2}>
+                <TextField
+                  label="间隔时长"
+                  type="number"
+                  value={formIntervalVal}
+                  onChange={(e) => setFormIntervalVal(Math.max(1, parseInt(e.target.value, 10) || 1))}
+                />
+                <TextField
+                  select
+                  label="时间单位"
+                  value={formIntervalUnit}
+                  onChange={(e) => setFormIntervalUnit(e.target.value)}
+                >
+                  <MenuItem value="mins">分钟</MenuItem>
+                  <MenuItem value="hours">小时</MenuItem>
+                  <MenuItem value="days">天</MenuItem>
+                </TextField>
+              </Box>
+              <FormHelperText>
+                保存、修改周期或重新启用后开始完整计时；立即执行会从执行时刻重新计算下一周期。
+              </FormHelperText>
             </Box>
           )}
         </Box>

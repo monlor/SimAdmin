@@ -39,6 +39,7 @@ import {
   KeyboardArrowRight,
   DeleteSweep,
   SmartToy,
+  Visibility,
 } from '@mui/icons-material'
 import { api } from '../api/current'
 import type {
@@ -55,8 +56,20 @@ import AutomationTaskCard from './automation/AutomationTaskCard'
 import AutomationTaskDialog from './automation/AutomationTaskDialog'
 import AutoCleanDialog from './automation/AutoCleanDialog'
 import AdvancedClearDialog from './automation/AdvancedClearDialog'
+import AutomationLogDetailDialog from './automation/AutomationLogDetailDialog'
 
 const LOG_PAGE_SIZE = 15
+
+const getLatestDetailLine = (detail: string) => {
+  const lines = detail.split('\n').filter((line) => line.trim().length > 0)
+  return lines.at(-1) ?? detail
+}
+
+const getStatusDisplay = (status: string) => {
+  if (status === 'running') return { label: '执行中', color: 'warning.main' }
+  if (status === 'success') return { label: '成功', color: 'success.main' }
+  return { label: '失败', color: 'error.main' }
+}
 
 const filterTextFieldSx = {
   '& .MuiInputBase-input': {
@@ -124,6 +137,7 @@ export default function AutomationCenter() {
   const [logStartDate, setLogStartDate] = useState('')
   const [logEndDate, setLogEndDate] = useState('')
   const [searchQuery, setSearchQuery] = useState('')
+  const [selectedLog, setSelectedLog] = useState<AutomationLogEntry | null>(null)
 
   useEffect(() => {
     setPageInput(String(logPage + 1))
@@ -143,6 +157,21 @@ export default function AutomationCenter() {
   // Log cleanup settings from notification center
   const [notificationConfig, setNotificationConfig] = useState<NotificationConfig | null>(null)
 
+  const refreshLatestLogs = useCallback(async () => {
+    const logsRes = await api.getAutomationLogs({ limit: 100 })
+    const latest = logsRes.data?.logs ?? []
+    const cache: Record<string, AutomationLogEntry> = {}
+    const reversed = [...latest].reverse()
+    reversed.forEach((log) => {
+      cache[log.task_id] = log
+    })
+    setLatestLogs(cache)
+    setSelectedLog((current) => {
+      if (!current) return null
+      return latest.find((log) => log.id === current.id) ?? current
+    })
+  }, [])
+
   // Load configuration and latest logs
   const loadData = useCallback(async () => {
     setLoading(true)
@@ -157,16 +186,7 @@ export default function AutomationCenter() {
       setBackupLocalDir(backupRes.data?.storage?.local_dir || '/opt/simadmin/backups')
 
       // Load latest logs to map status
-      const logsRes = await api.getAutomationLogs({ limit: 100 })
-      if (logsRes.data?.logs) {
-        const cache: Record<string, AutomationLogEntry> = {}
-        // Since logs are returned in descending order, we iterate backwards to keep the latest one
-        const reversed = [...logsRes.data.logs].reverse()
-        reversed.forEach((log) => {
-          cache[log.task_id] = log
-        })
-        setLatestLogs(cache)
-      }
+      await refreshLatestLogs()
 
       // Load notification cleanup config
       const notifRes = await api.getNotificationConfig()
@@ -178,15 +198,15 @@ export default function AutomationCenter() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [refreshLatestLogs])
 
   useEffect(() => {
     void loadData()
   }, [loadData])
 
   // Load logs for the logs tab
-  const loadLogs = useCallback(async () => {
-    setLogsLoading(true)
+  const loadLogs = useCallback(async (silent = false) => {
+    if (!silent) setLogsLoading(true)
     try {
       const res = await api.getAutomationLogs({
         type: filterType,
@@ -197,12 +217,17 @@ export default function AutomationCenter() {
         limit: LOG_PAGE_SIZE,
         offset: logPage * LOG_PAGE_SIZE,
       })
-      setLogs(res.data?.logs ?? [])
+      const nextLogs = res.data?.logs ?? []
+      setLogs(nextLogs)
       setLogTotal(res.data?.total ?? 0)
+      setSelectedLog((current) => {
+        if (!current) return null
+        return nextLogs.find((log) => log.id === current.id) ?? current
+      })
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
-      setLogsLoading(false)
+      if (!silent) setLogsLoading(false)
     }
   }, [filterType, filterStatus, logStartDate, logEndDate, searchQuery, logPage])
 
@@ -236,17 +261,35 @@ export default function AutomationCenter() {
     }
   }, [loadLogs, tab])
 
+  const hasRunningTask = useMemo(
+    () => Object.values(latestLogs).some((log) => log.status === 'running'),
+    [latestLogs]
+  )
+
+  useEffect(() => {
+    if (tab !== 1 && !hasRunningTask) return
+
+    const timer = window.setInterval(() => {
+      void refreshLatestLogs()
+      if (tab === 1) void loadLogs(true)
+    }, 2000)
+
+    return () => window.clearInterval(timer)
+  }, [hasRunningTask, loadLogs, refreshLatestLogs, tab])
+
   // Statistics calculation
   const stats = useMemo(() => {
     const total = config.tasks.length
     const enabled = config.tasks.filter((t) => t.enabled).length
     let successCount = 0
     let failedCount = 0
+    let runningCount = 0
     Object.values(latestLogs).forEach((log) => {
       if (log.status === 'success') successCount++
       else if (log.status === 'failed') failedCount++
+      else if (log.status === 'running') runningCount++
     })
-    return { total, enabled, success: successCount, failed: failedCount }
+    return { total, enabled, running: runningCount, success: successCount, failed: failedCount }
   }, [config.tasks, latestLogs])
 
   // Save config immediately to backend
@@ -294,12 +337,14 @@ export default function AutomationCenter() {
     try {
       const res = await api.testAutomationTask(taskId)
       if (res.status === 'ok') {
-        setSuccess('任务测试执行指令已下发，请在日志中查看结果')
-        // Refresh logs after a small delay
+        setSuccess('任务已开始执行，运行日志将自动更新')
+        setTab(1)
+        setLogPage(0)
+        // 后端任务异步启动，稍后拉取第一条“执行中”记录。
         setTimeout(() => {
-          void loadData()
-          if (tab === 1) void loadLogs()
-        }, 1500)
+          void refreshLatestLogs()
+          void loadLogs(true)
+        }, 250)
       } else {
         setError(res.message)
       }
@@ -403,6 +448,12 @@ export default function AutomationCenter() {
               size="small"
               label={`已启用 ${stats.enabled}`}
               color={stats.enabled > 0 ? 'primary' : 'default'}
+            />
+            <Chip
+              variant="outlined"
+              size="small"
+              label={`执行中 ${stats.running}`}
+              sx={{ color: 'warning.main', borderColor: 'warning.main', bgcolor: 'rgba(237, 108, 2, 0.04)' }}
             />
             <Chip
               variant="outlined"
@@ -517,6 +568,7 @@ export default function AutomationCenter() {
                 sx={[{ minWidth: 140 }, filterTextFieldSx]}
               >
                 <MenuItem value="">所有状态</MenuItem>
+                <MenuItem value="running">执行中</MenuItem>
                 <MenuItem value="success">成功</MenuItem>
                 <MenuItem value="failed">失败</MenuItem>
               </TextField>
@@ -568,7 +620,7 @@ export default function AutomationCenter() {
                     <TableCell sx={{ width: 150, fontWeight: 400 }}>时间</TableCell>
                     <TableCell sx={{ width: 150, fontWeight: 400 }}>任务名称</TableCell>
                     <TableCell sx={{ width: 120, fontWeight: 400 }}>任务类型</TableCell>
-                    <TableCell sx={{ width: 100, fontWeight: 400 }}>执行结果</TableCell>
+                    <TableCell sx={{ width: 100, fontWeight: 400 }}>执行状态</TableCell>
                     <TableCell sx={{ fontWeight: 400 }}>执行详情</TableCell>
                   </TableRow>
                 </TableHead>
@@ -586,8 +638,19 @@ export default function AutomationCenter() {
                       </TableCell>
                     </TableRow>
                   ) : (
-                    logs.map((log) => (
-                      <TableRow key={log.id} sx={{ height: 40, '& .MuiTableCell-root': { py: 0.5 } }}>
+                    logs.map((log) => {
+                      const statusDisplay = getStatusDisplay(log.status)
+                      return (
+                        <TableRow
+                          key={log.id}
+                          hover
+                          onClick={() => setSelectedLog(log)}
+                          sx={{
+                            height: 40,
+                            cursor: 'pointer',
+                            '& .MuiTableCell-root': { py: 0.5 },
+                          }}
+                        >
                         <TableCell sx={{ width: 150, whiteSpace: 'nowrap', fontWeight: 400 }}>{log.created_at}</TableCell>
                         <TableCell sx={{ width: 150, fontWeight: 400 }}>{log.task_name}</TableCell>
                         <TableCell sx={{ width: 120, fontWeight: 400 }}>
@@ -600,16 +663,41 @@ export default function AutomationCenter() {
                           sx={{
                             width: 100,
                             fontWeight: 400,
-                            color: log.status === 'success' ? 'primary.main' : 'error.main',
+                            color: statusDisplay.color,
                           }}
                         >
-                          {log.status === 'success' ? '成功' : '失败'}
+                          <Box display="flex" alignItems="center" gap={0.75}>
+                            {log.status === 'running' && <CircularProgress size={14} color="warning" />}
+                            {statusDisplay.label}
+                          </Box>
                         </TableCell>
-                        <TableCell sx={{ fontWeight: 400, wordBreak: 'break-all' }} title={log.detail}>
-                          {log.detail}
+                        <TableCell sx={{ fontWeight: 400, minWidth: 0 }}>
+                          <Box display="flex" alignItems="center" gap={1} minWidth={0}>
+                            <Typography
+                              variant="body2"
+                              noWrap
+                              title={getLatestDetailLine(log.detail)}
+                              sx={{ flex: 1, minWidth: 0 }}
+                            >
+                              {getLatestDetailLine(log.detail)}
+                            </Typography>
+                            <Button
+                              size="small"
+                              variant="text"
+                              startIcon={<Visibility fontSize="small" />}
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                setSelectedLog(log)
+                              }}
+                              sx={{ flexShrink: 0, whiteSpace: 'nowrap' }}
+                            >
+                              查看详情
+                            </Button>
+                          </Box>
                         </TableCell>
-                      </TableRow>
-                    ))
+                        </TableRow>
+                      )
+                    })
                   )}
                 </TableBody>
               </Table>
@@ -719,6 +807,11 @@ export default function AutomationCenter() {
         defaultStartDate={logStartDate}
         defaultEndDate={logEndDate}
         onConfirm={handleAdvancedClear}
+      />
+
+      <AutomationLogDetailDialog
+        log={selectedLog}
+        onClose={() => setSelectedLog(null)}
       />
 
       {/* 二次确认删除 Dialog */}

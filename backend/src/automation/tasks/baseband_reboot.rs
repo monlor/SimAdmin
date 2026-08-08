@@ -1,3 +1,4 @@
+use crate::automation::execution_log;
 use crate::automation::traits::AutomationTaskHandler;
 use crate::modem_manager::restart_baseband;
 use crate::state::AppState;
@@ -15,9 +16,10 @@ impl AutomationTaskHandler for BasebandRebootHandler {
     fn execute<'a>(
         &'a self,
         app: &'a AppState,
-        _params: &'a serde_json::Value,
+        params: &'a serde_json::Value,
     ) -> BoxFuture<'a, Result<()>> {
         async move {
+            execution_log::append(app, params, "正在准备重启基带");
             let auto_connect_data = !app.data_user_disabled.load(Ordering::SeqCst);
             let allow_roaming = app.config_manager.get_roaming_allowed();
             let apn_config = app.config_manager.get_apn_config();
@@ -31,6 +33,8 @@ impl AutomationTaskHandler for BasebandRebootHandler {
             .await
             .map_err(|e| anyhow!("{}", e))
             .context("重启基带失败")?;
+
+            execution_log::append(app, params, "基带重启完成");
 
             Ok(())
         }

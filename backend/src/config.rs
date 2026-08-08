@@ -2,6 +2,7 @@
 //!
 //! 使用 JSON 文件存储用户配置，支持热更新
 
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -1427,11 +1428,15 @@ pub struct AutomationTask {
     pub name: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Persisted schedule state for interval tasks. This is deliberately
+    /// separate from automation logs so clearing logs cannot retrigger work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<String>,
     pub trigger: AutomationTrigger,
     pub action: AutomationAction,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "config", rename_all = "snake_case")]
 pub enum AutomationTrigger {
     Fixed {
@@ -1442,6 +1447,85 @@ pub enum AutomationTrigger {
         interval_value: u64,
         interval_unit: String,
     },
+}
+
+fn automation_interval_duration(trigger: &AutomationTrigger) -> Option<ChronoDuration> {
+    let AutomationTrigger::Interval {
+        interval_value,
+        interval_unit,
+    } = trigger
+    else {
+        return None;
+    };
+    let value = i64::try_from(*interval_value).ok()?;
+    match interval_unit.as_str() {
+        "mins" => ChronoDuration::try_minutes(value),
+        "hours" => ChronoDuration::try_hours(value),
+        "days" => ChronoDuration::try_days(value),
+        _ => ChronoDuration::try_days(180),
+    }
+}
+
+fn automation_interval_next_run_at(
+    trigger: &AutomationTrigger,
+    now: &DateTime<Utc>,
+) -> Option<String> {
+    let next = now.to_owned() + automation_interval_duration(trigger)?;
+    Some(next.to_rfc3339_opts(SecondsFormat::Secs, true))
+}
+
+fn valid_automation_next_run_at(value: Option<&str>) -> Option<String> {
+    let value = value?;
+    DateTime::parse_from_rfc3339(value).ok()?;
+    Some(value.to_string())
+}
+
+fn initialize_automation_next_runs(automation: &mut AutomationConfig, now: &DateTime<Utc>) -> bool {
+    let mut changed = false;
+    for task in &mut automation.tasks {
+        match &task.trigger {
+            AutomationTrigger::Interval { .. } => {
+                if valid_automation_next_run_at(task.next_run_at.as_deref()).is_none() {
+                    task.next_run_at = automation_interval_next_run_at(&task.trigger, now);
+                    changed = true;
+                }
+            }
+            AutomationTrigger::Fixed { .. } => {
+                if task.next_run_at.take().is_some() {
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
+fn reconcile_automation_next_runs(
+    previous: &AutomationConfig,
+    incoming: &mut AutomationConfig,
+    now: &DateTime<Utc>,
+) {
+    let globally_reenabled = !previous.enabled && incoming.enabled;
+    for task in &mut incoming.tasks {
+        let previous_task = previous.tasks.iter().find(|item| item.id == task.id);
+        match &task.trigger {
+            AutomationTrigger::Interval { .. } => {
+                let reset_schedule = globally_reenabled
+                    || previous_task.is_none()
+                    || previous_task.is_some_and(|old| {
+                        old.trigger != task.trigger || (!old.enabled && task.enabled)
+                    });
+                task.next_run_at = if reset_schedule {
+                    automation_interval_next_run_at(&task.trigger, now)
+                } else {
+                    previous_task
+                        .and_then(|old| valid_automation_next_run_at(old.next_run_at.as_deref()))
+                        .or_else(|| automation_interval_next_run_at(&task.trigger, now))
+                };
+            }
+            AutomationTrigger::Fixed { .. } => task.next_run_at = None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1458,6 +1542,8 @@ pub enum AutomationAction {
     SendSms {
         phone_number: String,
         content: String,
+        #[serde(default)]
+        source_iccid: Option<String>,
         random_delay_seconds: Option<u32>,
         retry_limit: Option<u32>,
     },
@@ -1718,6 +1804,97 @@ mod tests {
         assert_eq!(
             template,
             "版本号: {{版本号}}\n时间: {{时间}}\n来源: {{本机号码}}"
+        );
+    }
+
+    #[test]
+    fn automation_sms_source_iccid_is_backward_compatible() {
+        let legacy: AutomationAction = serde_json::from_str(
+            r#"{"type":"send_sms","config":{"phone_number":"10010","content":"test","random_delay_seconds":0,"retry_limit":3}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            AutomationAction::SendSms {
+                source_iccid: None,
+                ..
+            }
+        ));
+
+        let selected = AutomationAction::SendSms {
+            phone_number: "10010".to_string(),
+            content: "test".to_string(),
+            source_iccid: Some("89860123456789012345".to_string()),
+            random_delay_seconds: Some(0),
+            retry_limit: Some(3),
+        };
+        let value = serde_json::to_value(selected).unwrap();
+        assert_eq!(value["config"]["source_iccid"], "89860123456789012345");
+    }
+
+    #[test]
+    fn legacy_interval_task_gets_a_full_initial_interval() {
+        let task: AutomationTask = serde_json::from_str(
+            r#"{
+                "id":"keepalive",
+                "name":"Keepalive",
+                "enabled":true,
+                "trigger":{"type":"interval","config":{"interval_value":180,"interval_unit":"days"}},
+                "action":{"type":"restart_baseband"}
+            }"#,
+        )
+        .unwrap();
+        assert!(task.next_run_at.is_none());
+
+        let now = DateTime::parse_from_rfc3339("2026-08-09T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut automation = AutomationConfig {
+            enabled: true,
+            tasks: vec![task],
+        };
+
+        assert!(initialize_automation_next_runs(&mut automation, &now));
+        assert_eq!(
+            automation.tasks[0].next_run_at.as_deref(),
+            Some("2027-02-05T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn re_enabling_interval_task_restarts_its_countdown() {
+        let now = DateTime::parse_from_rfc3339("2026-08-09T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let previous_task = AutomationTask {
+            id: "keepalive".to_string(),
+            name: "Keepalive".to_string(),
+            enabled: false,
+            next_run_at: Some("2026-08-10T00:00:00Z".to_string()),
+            trigger: AutomationTrigger::Interval {
+                interval_value: 30,
+                interval_unit: "days".to_string(),
+            },
+            action: AutomationAction::RestartBaseband,
+        };
+        let mut incoming = AutomationConfig {
+            enabled: true,
+            tasks: vec![AutomationTask {
+                enabled: true,
+                next_run_at: None,
+                ..previous_task.clone()
+            }],
+        };
+        let previous = AutomationConfig {
+            enabled: true,
+            tasks: vec![previous_task],
+        };
+
+        reconcile_automation_next_runs(&previous, &mut incoming, &now);
+
+        assert_eq!(
+            incoming.tasks[0].next_run_at.as_deref(),
+            Some("2026-09-08T00:00:00Z")
         );
     }
 }
@@ -2054,7 +2231,8 @@ impl ConfigManager {
         };
 
         migrate_legacy_webhook_config(&mut config);
-        let changed = migrate_update_templates(&mut config);
+        let changed = migrate_update_templates(&mut config)
+            | initialize_automation_next_runs(&mut config.automation, &Utc::now());
 
         let manager = Self {
             config: Arc::new(RwLock::new(config)),
@@ -2078,7 +2256,8 @@ impl ConfigManager {
         self.config.read().unwrap().clone()
     }
 
-    pub fn replace_config(&self, config: AppConfig) -> Result<(), String> {
+    pub fn replace_config(&self, mut config: AppConfig) -> Result<(), String> {
+        initialize_automation_next_runs(&mut config.automation, &Utc::now());
         {
             let mut current = self.config.write().unwrap();
             *current = config;
@@ -2092,12 +2271,42 @@ impl ConfigManager {
     }
 
     /// 更新自动化配置
-    pub fn set_automation_config(&self, automation: AutomationConfig) -> Result<(), String> {
+    pub fn set_automation_config(&self, mut automation: AutomationConfig) -> Result<(), String> {
         {
             let mut config = self.config.write().unwrap();
+            reconcile_automation_next_runs(&config.automation, &mut automation, &Utc::now());
             config.automation = automation;
         }
         self.save()
+    }
+
+    /// Consume the current interval occurrence before execution starts. The
+    /// persisted next time prevents duplicate starts across polling, log
+    /// cleanup, and service restarts.
+    pub fn mark_automation_task_triggered(&self, task_id: &str) -> Result<(), String> {
+        let changed = {
+            let mut config = self.config.write().unwrap();
+            let Some(task) = config
+                .automation
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == task_id)
+            else {
+                return Err(format!("Automation task not found: {task_id}"));
+            };
+            let Some(next_run_at) = automation_interval_next_run_at(&task.trigger, &Utc::now())
+            else {
+                return Ok(());
+            };
+            task.next_run_at = Some(next_run_at);
+            true
+        };
+
+        if changed {
+            self.save()
+        } else {
+            Ok(())
+        }
     }
 
     pub fn get_backup_config(&self) -> BackupConfig {

@@ -1,10 +1,11 @@
 use crate::automation::tasks::TaskRegistry;
+use crate::automation::{execution_log, execution_log::AUTOMATION_LOG_ID_PARAM};
 use crate::config::{AutomationAction, AutomationTask, AutomationTrigger};
 use crate::db::beijing_sms_now_string;
 use crate::notification::AutomationEvent;
 use crate::state::AppState;
 use anyhow::Result;
-use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, FixedOffset, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -15,6 +16,13 @@ fn beijing_offset() -> FixedOffset {
 
 fn beijing_now() -> DateTime<FixedOffset> {
     Utc::now().with_timezone(&beijing_offset())
+}
+
+fn interval_task_due(task: &AutomationTask, now: DateTime<Utc>) -> bool {
+    task.next_run_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|next| now >= next.with_timezone(&Utc))
 }
 
 pub fn spawn_automation_scheduler(app: AppState) {
@@ -61,52 +69,35 @@ pub fn spawn_automation_scheduler(app: AppState) {
                         }
                     }
                     AutomationTrigger::Interval {
-                        interval_value,
-                        interval_unit,
-                    } => {
-                        // 查询上一次运行历史
-                        let last_log = match app.database.get_last_log_for_task(&task.id) {
-                            Ok(res) => res,
-                            Err(e) => {
-                                error!("Failed to query last log for task {}: {:?}", task.id, e);
-                                None
-                            }
-                        };
-
-                        match last_log {
-                            Some(log) => {
-                                if let Ok(parsed) = NaiveDateTime::parse_from_str(
-                                    &log.created_at,
-                                    "%Y-%m-%d %H:%M:%S",
-                                ) {
-                                    let last_run_time =
-                                        beijing_offset().from_local_datetime(&parsed).unwrap();
-                                    let now = beijing_now();
-
-                                    let duration = match interval_unit.as_str() {
-                                        "mins" => Duration::minutes(*interval_value as i64),
-                                        "hours" => Duration::hours(*interval_value as i64),
-                                        "days" => Duration::days(*interval_value as i64),
-                                        _ => Duration::days(180), // 默认 Giffgaff 保号大间隔
-                                    };
-
-                                    now.signed_duration_since(last_run_time) >= duration
-                                } else {
-                                    true
-                                }
-                            }
-                            None => true, // 从无历史记录，触发首次运行
-                        }
-                    }
+                        interval_value: _,
+                        interval_unit: _,
+                    } => interval_task_due(&task, Utc::now()),
                 };
 
                 if should_trigger {
+                    let Some(run_guard) = app.automation_task_runs.try_start(&task.id) else {
+                        info!(
+                            task_id = %task.id,
+                            task_name = %task.name,
+                            "Automation task is already running; skipping duplicate trigger"
+                        );
+                        continue;
+                    };
+                    if let Err(err) = app.config_manager.mark_automation_task_triggered(&task.id) {
+                        warn!(
+                            task_id = %task.id,
+                            error = %err,
+                            "Failed to persist next automation run time"
+                        );
+                    }
                     let registry_clone = registry.clone();
                     let app_clone = app.clone();
                     let task_clone = task.clone();
 
                     tokio::spawn(async move {
-                        if let Err(e) = execute_task(&app_clone, &registry_clone, &task_clone).await
+                        let _run_guard = run_guard;
+                        if let Err(e) =
+                            execute_task(&app_clone, &registry_clone, &task_clone, "自动调度").await
                         {
                             error!("Automation task {} failed: {:?}", task_clone.id, e);
                         }
@@ -136,10 +127,11 @@ pub fn spawn_automation_scheduler(app: AppState) {
     });
 }
 
-async fn execute_task(
+pub(crate) async fn execute_task(
     app: &AppState,
     registry: &TaskRegistry,
     task: &AutomationTask,
+    trigger_source: &str,
 ) -> Result<()> {
     info!("Triggering automation task: {} ({})", task.name, task.id);
 
@@ -150,21 +142,28 @@ async fn execute_task(
         AutomationAction::SendSms { .. } => "send_sms",
     };
 
+    let start_detail = execution_log::timestamped(format!("任务开始（{trigger_source}）"));
+    let log_id = app.database.insert_automation_log(
+        &task.id,
+        &task.name,
+        task_type,
+        "running",
+        &start_detail,
+    )?;
+
     let handler = match registry.get(task_type) {
         Some(h) => h,
         None => {
-            let err_msg = format!("No handler found for task type: {}", task_type);
-            let _ = app
-                .database
-                .insert_automation_log(&task.id, &task.name, task_type, "failed", &err_msg);
+            let err_msg = format!("未找到任务处理器：{}", task_type);
+            execution_log::finish(app, log_id, "failed", &err_msg);
             return Err(anyhow::anyhow!(err_msg));
         }
     };
 
-    let mut delay_secs = 0u64;
+    let mut handler_manages_timeout = false;
     // 参数转换
-    let params = match &task.action {
-        AutomationAction::RestartBaseband => serde_json::Value::Null,
+    let mut params = match &task.action {
+        AutomationAction::RestartBaseband => serde_json::json!({}),
         AutomationAction::RebootDevice { delay_seconds } => {
             serde_json::json!({ "delay_seconds": delay_seconds })
         }
@@ -180,36 +179,50 @@ async fn execute_task(
         AutomationAction::SendSms {
             phone_number,
             content,
+            source_iccid,
             random_delay_seconds,
             retry_limit,
         } => {
-            delay_secs = u64::from(random_delay_seconds.unwrap_or(0));
+            handler_manages_timeout = true;
             serde_json::json!({
                 "phone_number": phone_number,
                 "content": content,
+                "source_iccid": source_iccid,
                 "random_delay_seconds": random_delay_seconds,
                 "retry_limit": retry_limit
             })
         }
     };
+    params
+        .as_object_mut()
+        .expect("automation task parameters must be an object")
+        .insert(
+            AUTOMATION_LOG_ID_PARAM.to_string(),
+            serde_json::json!(log_id),
+        );
+    execution_log::append_by_id(app, log_id, "任务参数已加载，开始执行");
 
-    // 执行任务并控制超时（基准60秒 + 随机延迟时间）
-    let result = tokio::time::timeout(
-        tokio::time::Duration::from_secs(60 + delay_secs),
-        handler.execute(app, &params),
-    )
-    .await;
-
-    let (status, detail) = match result {
-        Ok(Ok(_)) => ("success", "执行成功".to_string()),
-        Ok(Err(e)) => ("failed", format!("执行失败: {}", e)),
-        Err(_) => ("failed", "执行超时 (超过60秒限制)".to_string()),
+    // SMS owns bounded timeouts for confirmation, retries, eSIM switching and
+    // recovery internally. Do not cancel it from outside before it can finish
+    // retries or restore the original Profile.
+    let result = if handler_manages_timeout {
+        Ok(handler.execute(app, &params).await)
+    } else {
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(60),
+            handler.execute(app, &params),
+        )
+        .await
     };
 
-    // 1. 写入 SQLite 日志表
-    let _ = app
-        .database
-        .insert_automation_log(&task.id, &task.name, task_type, status, &detail);
+    let (status, detail) = match result {
+        Ok(Ok(_)) => ("success", "任务执行成功".to_string()),
+        Ok(Err(e)) => ("failed", format!("任务执行失败：{}", e)),
+        Err(_) => ("failed", "任务执行超时（超过 60 秒限制）".to_string()),
+    };
+
+    // 更新同一条 SQLite 日志，确保前端能看到完整的执行生命周期。
+    execution_log::finish(app, log_id, status, &detail);
 
     // 2. 发出通知事件
     let event = AutomationEvent {
@@ -230,4 +243,39 @@ async fn execute_task(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn interval_task(next_run_at: &str) -> AutomationTask {
+        AutomationTask {
+            id: "task-1".to_string(),
+            name: "Task".to_string(),
+            enabled: true,
+            next_run_at: Some(next_run_at.to_string()),
+            trigger: AutomationTrigger::Interval {
+                interval_value: 30,
+                interval_unit: "days".to_string(),
+            },
+            action: AutomationAction::RestartBaseband,
+        }
+    }
+
+    #[test]
+    fn interval_task_only_becomes_due_at_persisted_next_run() {
+        let now = DateTime::parse_from_rfc3339("2026-08-09T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert!(!interval_task_due(
+            &interval_task("2026-08-10T00:00:00Z"),
+            now
+        ));
+        assert!(interval_task_due(
+            &interval_task("2026-08-08T00:00:00Z"),
+            now
+        ));
+    }
 }

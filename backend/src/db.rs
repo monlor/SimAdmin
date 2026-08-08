@@ -180,8 +180,6 @@ pub struct OwnNumberCacheEntry {
     pub updated_at: String,
 }
 
-
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EsimProfileCacheEntry {
     pub iccid: String,
@@ -637,6 +635,16 @@ impl Database {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_automation_logs_created_at ON automation_logs(created_at DESC)",
             [],
+        )?;
+
+        let interrupted_at = beijing_sms_now_string();
+        conn.execute(
+            "UPDATE automation_logs
+             SET status = 'failed',
+                 detail = detail || CASE WHEN detail = '' THEN '' ELSE char(10) END
+                     || '[' || ?1 || '] 服务重启，任务执行已中断'
+             WHERE status = 'running'",
+            params![interrupted_at],
         )?;
 
         Ok(Self {
@@ -1665,8 +1673,6 @@ impl Database {
         Ok(None)
     }
 
-
-
     // ==================== eSIM Profile cache ====================
 
     pub fn upsert_esim_profile_cache(&self, entry: &EsimProfileCacheEntry) -> Result<()> {
@@ -2102,6 +2108,31 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
+    /// 向同一次自动化执行追加一行过程日志
+    pub fn append_automation_log_detail(&self, log_id: i64, line: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE automation_logs
+             SET detail = detail || CASE WHEN detail = '' THEN '' ELSE char(10) END || ?2
+             WHERE id = ?1",
+            params![log_id, line],
+        )?;
+        Ok(())
+    }
+
+    /// 结束同一次自动化执行，并追加最终结果
+    pub fn finish_automation_log(&self, log_id: i64, status: &str, line: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE automation_logs
+             SET status = ?2,
+                 detail = detail || CASE WHEN detail = '' THEN '' ELSE char(10) END || ?3
+             WHERE id = ?1",
+            params![log_id, status, line],
+        )?;
+        Ok(())
+    }
+
     /// 获取自动化执行日志（分页与过滤）
     pub fn get_automation_logs(
         &self,
@@ -2307,7 +2338,32 @@ mod tests {
         assert!(!entry.updated_at.is_empty());
     }
 
+    #[test]
+    fn automation_execution_log_tracks_one_run_from_start_to_finish() {
+        let db = test_db();
+        let log_id = db
+            .insert_automation_log(
+                "task-1",
+                "短信保号",
+                "send_sms",
+                "running",
+                "[2026-08-09 12:00:00] 任务开始",
+            )
+            .unwrap();
 
+        db.append_automation_log_detail(log_id, "[2026-08-09 12:00:01] 已获取信号")
+            .unwrap();
+        db.finish_automation_log(log_id, "success", "[2026-08-09 12:00:12] 执行成功")
+            .unwrap();
+
+        let result = db.get_automation_logs("", "", "", "", "", 10, 0).unwrap();
+        assert_eq!(result.total, 1);
+        assert_eq!(result.logs[0].status, "success");
+        assert!(result.logs[0].detail.contains("任务开始"));
+        assert!(result.logs[0].detail.contains("已获取信号"));
+        assert!(result.logs[0].detail.contains("执行成功"));
+        assert_eq!(result.logs[0].detail.lines().count(), 3);
+    }
 
     #[test]
     fn esim_profile_cache_persists_state_permissions_and_updated_at() {

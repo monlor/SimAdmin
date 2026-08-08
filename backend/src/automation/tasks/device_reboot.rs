@@ -1,3 +1,4 @@
+use crate::automation::execution_log;
 use crate::automation::traits::AutomationTaskHandler;
 use crate::handlers::run_safe_os_reboot_sequence;
 use crate::state::AppState;
@@ -24,6 +25,11 @@ impl AutomationTaskHandler for DeviceRebootHandler {
         let system_events = app.system_event_emitter.clone();
 
         async move {
+            execution_log::append(
+                app,
+                params,
+                format!("已提交设备重启请求，将在 {delay_seconds} 秒后执行"),
+            );
             // 启动安全重启序列，它在后台异步执行（带有延迟）
             tokio::spawn(async move {
                 run_safe_os_reboot_sequence(delay_seconds, system_events).await;
