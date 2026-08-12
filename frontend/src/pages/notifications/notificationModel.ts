@@ -73,6 +73,7 @@ export function defaultRateLimitForChannel(type: NotificationChannelKey): Notifi
     case 'wecom_robot':
     case 'dingtalk_robot':
     case 'telegram':
+    case 'ntfy':
     case 'email':
       return { enabled: true, max_messages: 20, window_seconds: 60 }
     case 'serverchan3':
@@ -96,6 +97,7 @@ export const CHANNEL_DEFS: ChannelDef[] = [
   { key: 'dingtalk_app', label: '钉钉企业内机器人', icon: Work },
   { key: 'feishu_robot', label: '飞书机器人', icon: Chat },
   { key: 'telegram', label: 'Telegram 机器人', icon: Send },
+  { key: 'ntfy', label: 'ntfy', icon: NotificationsActive },
   { key: 'email', label: 'Email', icon: Email },
   { key: 'serverchan3', label: 'Server酱3', icon: Webhook },
 ]
@@ -343,6 +345,8 @@ export function defaultChannelConfig(type: NotificationChannelKey): Record<strin
       return { webhook_url: '', token: '', secret: '' }
     case 'telegram':
       return { api_base_url: '', bot_token: '', chat_id: '', parse_mode: '', disable_web_page_preview: true }
+    case 'ntfy':
+      return { server_url: 'https://ntfy.sh', topic: '', token: '', username: '', password: '', priority: 3, tags: '', click_url: '' }
     case 'email':
       return {
         smtp_host: '',

@@ -2,8 +2,8 @@ use crate::config::{
     BarkConfig, ConfigManager, DingtalkAppConfig, DingtalkRobotConfig, EmailConfig,
     FeishuRobotConfig, LegacyNotificationConfig, MatcherOperator, MessageChannelConfig,
     NotificationChannel, NotificationChannelInstance, NotificationConfig, NotificationEventType,
-    NotificationRule, PushPlusConfig, QuietHoursSchedule, ServerChan3Config, TelegramConfig,
-    WebhookConfig, WecomAppConfig, WecomRobotConfig,
+    NotificationRule, NtfyConfig, PushPlusConfig, QuietHoursSchedule, ServerChan3Config,
+    TelegramConfig, WebhookConfig, WecomAppConfig, WecomRobotConfig,
 };
 use crate::db::{
     CallRecord, Database, NewNotificationQueueItem, NotificationQueueEntry, SmsMessage,
@@ -1070,6 +1070,10 @@ impl NotificationSender {
                 let config = parse_instance_config::<TelegramConfig>(channel)?;
                 self.send_telegram_text(&config, text.to_string()).await
             }
+            NotificationChannel::Ntfy => {
+                let config = parse_instance_config::<NtfyConfig>(channel)?;
+                self.send_ntfy_message(&config, title, text).await
+            }
             NotificationChannel::Email => {
                 let config = parse_instance_config::<EmailConfig>(channel)?;
                 self.send_email_message(&config, title.to_string(), text.to_string())
@@ -1121,6 +1125,7 @@ impl NotificationSender {
             NotificationChannel::Telegram => {
                 self.send_telegram_call(&config.telegram, call, force).await
             }
+            NotificationChannel::Ntfy => Ok("ntfy skipped in legacy mode".to_string()),
             NotificationChannel::Email => Ok("Email skipped".to_string()),
             NotificationChannel::ServerChan3 => Ok("Server酱3 skipped".to_string()),
         }
@@ -1155,6 +1160,7 @@ impl NotificationSender {
                     .await
             }
             NotificationChannel::Telegram => self.send_telegram_ddns(&config.telegram, event).await,
+            NotificationChannel::Ntfy => Ok("ntfy skipped in legacy mode".to_string()),
             NotificationChannel::Email => Ok("Email skipped".to_string()),
             NotificationChannel::ServerChan3 => Ok("Server酱3 skipped".to_string()),
         }
@@ -1200,6 +1206,7 @@ impl NotificationSender {
                 self.send_telegram_version_update(&config.telegram, event)
                     .await
             }
+            NotificationChannel::Ntfy => Ok("ntfy skipped in legacy mode".to_string()),
             NotificationChannel::Email => Ok("Email skipped".to_string()),
             NotificationChannel::ServerChan3 => Ok("Server酱3 skipped".to_string()),
         }
@@ -2350,6 +2357,33 @@ impl NotificationSender {
         serverchan3_response_result(response.status(), response.text().await.unwrap_or_default())
     }
 
+    async fn send_ntfy_message(
+        &self,
+        config: &NtfyConfig,
+        title: &str,
+        message: &str,
+    ) -> Result<String, String> {
+        let url = ntfy_server_url(config);
+        let payload = ntfy_payload(config, title, message)?;
+        let mut request = self.client.post(&url).json(&payload);
+
+        if !config.token.trim().is_empty() {
+            request = request.bearer_auth(config.token.trim());
+        } else if !config.username.trim().is_empty() {
+            request = request.basic_auth(config.username.trim(), Some(config.password.as_str()));
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|err| format!("Failed to send ntfy message: {err}"))?;
+        response_result(
+            "ntfy",
+            response.status(),
+            response.text().await.unwrap_or_default(),
+        )
+    }
+
     async fn send_email_message(
         &self,
         config: &EmailConfig,
@@ -2748,6 +2782,7 @@ impl NotificationChannel {
             NotificationChannel::DingtalkApp => "dingtalk_app",
             NotificationChannel::FeishuRobot => "feishu_robot",
             NotificationChannel::Telegram => "telegram",
+            NotificationChannel::Ntfy => "ntfy",
             NotificationChannel::Email => "email",
             NotificationChannel::ServerChan3 => "serverchan3",
         }
@@ -2764,6 +2799,7 @@ impl NotificationChannel {
             NotificationChannel::DingtalkApp => "钉钉企业内机器人",
             NotificationChannel::FeishuRobot => "飞书机器人",
             NotificationChannel::Telegram => "Telegram机器人",
+            NotificationChannel::Ntfy => "ntfy",
             NotificationChannel::Email => "Email",
             NotificationChannel::ServerChan3 => "Server酱3",
         }
@@ -2771,7 +2807,7 @@ impl NotificationChannel {
 }
 
 #[allow(dead_code)]
-fn all_channels() -> [NotificationChannel; 11] {
+fn all_channels() -> [NotificationChannel; 12] {
     [
         NotificationChannel::Webhook,
         NotificationChannel::Bark,
@@ -2782,6 +2818,7 @@ fn all_channels() -> [NotificationChannel; 11] {
         NotificationChannel::DingtalkApp,
         NotificationChannel::FeishuRobot,
         NotificationChannel::Telegram,
+        NotificationChannel::Ntfy,
         NotificationChannel::Email,
         NotificationChannel::ServerChan3,
     ]
@@ -2807,6 +2844,7 @@ fn should_send_sms_to_channel(
         NotificationChannel::DingtalkApp => should_send_sms(&config.dingtalk_app.common, false),
         NotificationChannel::FeishuRobot => should_send_sms(&config.feishu_robot.common, false),
         NotificationChannel::Telegram => should_send_sms(&config.telegram.common, false),
+        NotificationChannel::Ntfy => false,
         NotificationChannel::Email => should_send_sms(&config.email.common, false),
         NotificationChannel::ServerChan3 => should_send_sms(&config.serverchan3.common, false),
     }
@@ -2842,6 +2880,7 @@ fn should_send_update_to_channel(
         NotificationChannel::DingtalkApp => should_send_update(&config.dingtalk_app.common),
         NotificationChannel::FeishuRobot => should_send_update(&config.feishu_robot.common),
         NotificationChannel::Telegram => should_send_update(&config.telegram.common),
+        NotificationChannel::Ntfy => false,
         NotificationChannel::Email => should_send_update(&config.email.common),
         NotificationChannel::ServerChan3 => should_send_update(&config.serverchan3.common),
     }
@@ -3300,6 +3339,42 @@ fn telegram_send_message_url(config: &TelegramConfig) -> String {
     )
 }
 
+fn ntfy_server_url(config: &NtfyConfig) -> String {
+    let configured = config.server_url.trim();
+    let base = if configured.is_empty() {
+        "https://ntfy.sh"
+    } else {
+        configured
+    };
+    base.trim_end_matches('/').to_string()
+}
+
+fn ntfy_payload(config: &NtfyConfig, title: &str, message: &str) -> Result<Value, String> {
+    let topic = config.topic.trim();
+    if topic.is_empty() {
+        return Err("ntfy Topic 未配置".to_string());
+    }
+
+    let mut payload = Map::new();
+    payload.insert("topic".to_string(), json!(topic));
+    payload.insert("title".to_string(), json!(title));
+    payload.insert("message".to_string(), json!(message));
+    payload.insert("priority".to_string(), json!(config.priority.clamp(1, 5)));
+
+    let tags = config
+        .tags
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .collect::<Vec<_>>();
+    if !tags.is_empty() {
+        payload.insert("tags".to_string(), json!(tags));
+    }
+    insert_non_empty(&mut payload, "click", &config.click_url);
+
+    Ok(Value::Object(payload))
+}
+
 fn format_channel_errcode(label: &str, errcode: i64, message: &str) -> String {
     if errcode == 60020 {
         return format!(
@@ -3564,6 +3639,44 @@ fn compute_legacy_signature(secret: &str, data: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::RuleMatcher;
+
+    #[test]
+    fn ntfy_payload_contains_supported_options() {
+        let config = NtfyConfig {
+            topic: " simadmin ".to_string(),
+            priority: 5,
+            tags: "warning, phone, ".to_string(),
+            click_url: "https://example.com/notifications".to_string(),
+            ..NtfyConfig::default()
+        };
+
+        let payload = ntfy_payload(&config, "测试标题", "测试正文").unwrap();
+        assert_eq!(payload["topic"], "simadmin");
+        assert_eq!(payload["title"], "测试标题");
+        assert_eq!(payload["message"], "测试正文");
+        assert_eq!(payload["priority"], 5);
+        assert_eq!(payload["tags"], json!(["warning", "phone"]));
+        assert_eq!(payload["click"], "https://example.com/notifications");
+    }
+
+    #[test]
+    fn ntfy_payload_requires_topic_and_clamps_priority() {
+        let missing_topic = NtfyConfig::default();
+        assert_eq!(
+            ntfy_payload(&missing_topic, "title", "message").unwrap_err(),
+            "ntfy Topic 未配置"
+        );
+
+        let config = NtfyConfig {
+            topic: "simadmin".to_string(),
+            priority: 9,
+            ..NtfyConfig::default()
+        };
+        assert_eq!(
+            ntfy_payload(&config, "title", "message").unwrap()["priority"],
+            5
+        );
+    }
 
     #[test]
     fn quiet_schedule_matches_weekday_and_overnight_range() {

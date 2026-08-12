@@ -205,6 +205,26 @@ pub struct TelegramConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NtfyConfig {
+    #[serde(default = "default_ntfy_server_url")]
+    pub server_url: String,
+    #[serde(default)]
+    pub topic: String,
+    #[serde(default)]
+    pub token: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default = "default_ntfy_priority")]
+    pub priority: u8,
+    #[serde(default)]
+    pub tags: String,
+    #[serde(default)]
+    pub click_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerChan3Config {
     #[serde(flatten)]
     pub common: MessageChannelConfig,
@@ -283,6 +303,7 @@ pub enum NotificationChannel {
     DingtalkApp,
     FeishuRobot,
     Telegram,
+    Ntfy,
     Email,
     #[serde(rename = "serverchan3", alias = "server_chan3")]
     ServerChan3,
@@ -756,6 +777,14 @@ fn default_telegram_api_base_url() -> String {
     String::new()
 }
 
+fn default_ntfy_server_url() -> String {
+    "https://ntfy.sh".to_string()
+}
+
+fn default_ntfy_priority() -> u8 {
+    3
+}
+
 fn default_dingtalk_msg_key() -> String {
     "sampleText".to_string()
 }
@@ -917,6 +946,21 @@ impl Default for TelegramConfig {
     }
 }
 
+impl Default for NtfyConfig {
+    fn default() -> Self {
+        Self {
+            server_url: default_ntfy_server_url(),
+            topic: String::new(),
+            token: String::new(),
+            username: String::new(),
+            password: String::new(),
+            priority: default_ntfy_priority(),
+            tags: String::new(),
+            click_url: String::new(),
+        }
+    }
+}
+
 impl Default for ServerChan3Config {
     fn default() -> Self {
         Self {
@@ -1055,6 +1099,7 @@ fn channel_label(channel: NotificationChannel) -> &'static str {
         NotificationChannel::DingtalkApp => "钉钉企业内机器人",
         NotificationChannel::FeishuRobot => "飞书机器人",
         NotificationChannel::Telegram => "Telegram 机器人",
+        NotificationChannel::Ntfy => "ntfy",
         NotificationChannel::Email => "Email",
         NotificationChannel::ServerChan3 => "Server酱3",
     }
@@ -1731,6 +1776,22 @@ mod tests {
             serde_json::to_string(&NotificationChannel::ServerChan3).unwrap(),
             r#""serverchan3""#
         );
+    }
+
+    #[test]
+    fn notification_channel_accepts_ntfy_key_and_defaults() {
+        assert!(matches!(
+            serde_json::from_str::<NotificationChannel>(r#""ntfy""#).unwrap(),
+            NotificationChannel::Ntfy
+        ));
+        assert_eq!(
+            serde_json::to_string(&NotificationChannel::Ntfy).unwrap(),
+            r#""ntfy""#
+        );
+
+        let config: NtfyConfig = serde_json::from_str(r#"{"topic":"simadmin"}"#).unwrap();
+        assert_eq!(config.server_url, "https://ntfy.sh");
+        assert_eq!(config.priority, 3);
     }
 
     #[test]

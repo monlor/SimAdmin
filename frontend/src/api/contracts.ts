@@ -608,6 +608,7 @@ export type NotificationChannelKey =
   | 'dingtalk_app'
   | 'feishu_robot'
   | 'telegram'
+  | 'ntfy'
   | 'email'
   | 'serverchan3'
 
@@ -695,6 +696,17 @@ export interface TelegramConfig extends MessageChannelConfig {
   chat_id: string
   parse_mode: string
   disable_web_page_preview: boolean
+}
+
+export interface NtfyConfig {
+  server_url: string
+  topic: string
+  token: string
+  username: string
+  password: string
+  priority: number
+  tags: string
+  click_url: string
 }
 
 export interface EmailConfig extends MessageChannelConfig {

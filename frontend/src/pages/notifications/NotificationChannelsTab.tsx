@@ -270,16 +270,18 @@ export default function NotificationChannelsTab({
     key: string,
     label: string,
     min = 0,
+    max?: number,
   ) => (
     <TextField
       type="number"
       label={label}
       value={Number(channel.config[key]) || min}
       onChange={(event: ChangeEvent<HTMLInputElement>) => {
-        const value = Math.max(min, Math.trunc(Number(event.target.value) || min))
+        const parsed = Math.max(min, Math.trunc(Number(event.target.value) || min))
+        const value = max === undefined ? parsed : Math.min(max, parsed)
         onPatchChannelConfig(channel.id, { [key]: value })
       }}
-      inputProps={{ min }}
+      inputProps={{ min, max }}
       fullWidth
       sx={channelTextFieldSx}
     />
@@ -515,6 +517,22 @@ export default function NotificationChannelsTab({
             {renderStringField(channel, 'parse_mode', 'Parse Mode', { select: ['', 'MarkdownV2', 'HTML'] })}
             {renderStringField(channel, 'api_base_url', 'API 反代地址', { endAdornment: renderApiBaseUrlHelp('telegram') })}
             {renderBoolField(channel, 'disable_web_page_preview', '禁用链接预览')}
+          </Box>
+        )
+      case 'ntfy':
+        return (
+          <Box sx={fieldStackSx}>
+            {renderStringField(channel, 'server_url', '服务器地址')}
+            {renderStringField(channel, 'topic', 'Topic')}
+            {renderStringField(channel, 'token', 'Access Token（推荐）', { password: true })}
+            {renderStringField(channel, 'username', '用户名（可选）')}
+            {renderStringField(channel, 'password', '密码（可选）', { password: true })}
+            {renderNumberConfigField(channel, 'priority', '优先级（1-5）', 1, 5)}
+            {renderStringField(channel, 'tags', '标签（逗号分隔）')}
+            {renderStringField(channel, 'click_url', '点击跳转 URL（可选）')}
+            <Typography variant="caption" color="text.secondary">
+              Token 优先于用户名密码；公共 Topic 请使用难以猜测的名称。
+            </Typography>
           </Box>
         )
       case 'email':
