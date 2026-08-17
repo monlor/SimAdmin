@@ -434,13 +434,15 @@ export default function NetworkPage() {
     try {
       const response = await api.registerOperatorManual(mccmnc)
       if (response.status === 'ok') {
-        setSuccess(`正在注册到运营商 ${mccmnc}...`)
-        setTimeout(() => void loadData(3), 3000)
+        setSuccess(`已手动选择运营商 ${mccmnc}`)
+        await loadData(3)
       } else {
         setError(response.message || '注册失败')
+        await loadData(3)
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
+      await loadData(3)
     } finally {
       setRegistering(false)
     }
@@ -457,13 +459,15 @@ export default function NetworkPage() {
     try {
       const response = await api.registerOperatorAuto()
       if (response.status === 'ok') {
-        setSuccess('已启动自动注册...')
-        setTimeout(() => void loadData(3), 3000)
+        setSuccess('已开启自动选择运营商')
+        await loadData(3)
       } else {
         setError(response.message || '自动注册失败')
+        await loadData(3)
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
+      await loadData(3)
     } finally {
       setRegistering(false)
     }
@@ -884,6 +888,34 @@ export default function NetworkPage() {
 
       {/* Tab 4: 运营商管理 */}
       <TabPanel value={tabValue} index={3}>
+        <Card sx={{ mb: 3 }}>
+          <CardContent>
+            <Typography variant="subtitle1" fontWeight={700} mb={1}>运营商选择方式</Typography>
+            <Box display="flex" gap={1}>
+              <Button
+                fullWidth
+                variant={operators?.selection_mode !== 'manual' ? 'contained' : 'outlined'}
+                onClick={handleRegisterAuto}
+                disabled={registering || scanning}
+              >
+                自动选择
+              </Button>
+              <Button
+                fullWidth
+                variant={operators?.selection_mode === 'manual' ? 'contained' : 'outlined'}
+                onClick={handleScanOperators}
+                disabled={registering || scanning}
+              >
+                手动选择
+              </Button>
+            </Box>
+            <Typography variant="body2" color="text.secondary" mt={1}>
+              {operators?.selection_mode === 'manual'
+                ? '手动选择模式：扫描附近网络后，可选择一个运营商尝试注册。扫描到不代表 SIM 一定可以注册。'
+                : '自动选择模式：运营商由基带自动选择，不进行手动切换。'}
+            </Typography>
+          </CardContent>
+        </Card>
         <Grid container spacing={3}>
           <Grid size={{ xs: 12, md: 6 }}>
             <Card>
@@ -914,7 +946,7 @@ export default function NetworkPage() {
                             <Box display="flex" alignItems="center" gap={1}>
                               <Typography fontWeight={600}>{op.name}</Typography>
                               <Chip
-                                label={op.status}
+                                label={op.status === 'current' ? '当前' : op.status === 'forbidden' ? '禁止' : '已发现'}
                                 size="small"
                                 color={op.status === 'current' ? 'success' : op.status === 'available' ? 'primary' : 'default'}
                               />
@@ -932,14 +964,14 @@ export default function NetworkPage() {
                           }
                         />
                         <ListItemSecondaryAction>
-                          {op.status !== 'current' && op.status !== 'forbidden' && (
+                          {operators.selection_mode === 'manual' && op.status !== 'current' && op.status !== 'forbidden' && (
                             <Button
                               size="small"
                               variant="outlined"
                               onClick={() => { handleRegisterManual(`${op.mcc}${op.mnc}`) }}
                               disabled={registering}
                             >
-                              注册
+                              选择
                             </Button>
                           )}
                         </ListItemSecondaryAction>
@@ -969,21 +1001,14 @@ export default function NetworkPage() {
                   fullWidth
                   startIcon={scanning ? <CircularProgress size={20} color="inherit" /> : <Search />}
                   onClick={() => handleScanOperators()}
-                  disabled={scanning}
+                  disabled={scanning || operators?.selection_mode !== 'manual'}
                   sx={{ mb: 2 }}
                 >
-                  {scanning ? '正在扫描...' : '扫描可用运营商'}
+                  {scanning ? '正在扫描...' : '扫描附近运营商'}
                 </Button>
-                <Divider sx={{ my: 2 }} />
-                <Button
-                  variant="outlined"
-                  fullWidth
-                  startIcon={registering ? <CircularProgress size={20} /> : <Refresh />}
-                  onClick={handleRegisterAuto}
-                  disabled={registering}
-                >
-                  {registering ? '正在注册...' : '自动注册运营商'}
-                </Button>
+                {operators?.selection_mode !== 'manual' && (
+                  <Alert severity="info">请先切换到“手动选择”模式。</Alert>
+                )}
               </CardContent>
             </Card>
           </Grid>

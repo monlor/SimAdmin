@@ -61,9 +61,11 @@ const MODEM_DISCOVERY_FAILURE_CACHE_SECS: u64 = 30;
 // eSIM Profile 切换会使 ModemManager 丢失设备对象；部分基带重新枚举需要较长时间。
 // Keep this aligned with the 5-minute profile-enable timeout exposed by the UI.
 const ESIM_PROFILE_SWITCH_MODEM_ENUMERATION_TIMEOUT_SECS: u64 = 300;
-const OPERATOR_SCAN_REQUEST_TIMEOUT_SECS: u64 = 45;
-const OPERATOR_SCAN_CACHE_POLL_SECS: u64 = 20;
-const NETWORK_REGISTER_TIMEOUT_SECS: u64 = 45;
+const OPERATOR_SCAN_REQUEST_TIMEOUT_SECS: u64 = 180;
+// ModemManager's 3GPP Register call may take about 60 seconds before returning
+// NetworkTimeout. Keep our outer timeout longer so a failed request is fully
+// finished before attempting to restore the previous operator.
+const NETWORK_REGISTER_TIMEOUT_SECS: u64 = 75;
 const SEARCHING_REGISTER_THRESHOLD: u32 = 4;
 const SEARCHING_RADIO_RESET_THRESHOLD: u32 = 8;
 const DATA_CONNECT_RETRY_COOLDOWN_SECS: u64 = 120;
@@ -97,6 +99,26 @@ static BASEBAND_RESTART_RUNNING: AtomicBool = AtomicBool::new(false);
 static BASEBAND_RESTART_ACTIVE_RUNS: AtomicUsize = AtomicUsize::new(0);
 static BASEBAND_RESTART_REGISTRATION: std::sync::Mutex<Option<String>> =
     std::sync::Mutex::new(None);
+static OPERATOR_SCAN_CACHE: std::sync::Mutex<Vec<OperatorInfo>> = std::sync::Mutex::new(Vec::new());
+static OPERATOR_SELECTION_STATE: std::sync::Mutex<OperatorSelectionState> =
+    std::sync::Mutex::new(OperatorSelectionState::new());
+
+#[derive(Debug, Clone)]
+struct OperatorSelectionState {
+    mode: &'static str,
+    restore_mode: &'static str,
+    restore_operator: String,
+}
+
+impl OperatorSelectionState {
+    const fn new() -> Self {
+        Self {
+            mode: "auto",
+            restore_mode: "auto",
+            restore_operator: String::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 struct SimpleConnectSettings {
@@ -2541,6 +2563,51 @@ async fn get_cells_data_qmicli(
 mod tests {
     use super::*;
 
+    fn owned_string(value: &str) -> OwnedValue {
+        OwnedValue::from(zbus::zvariant::Str::from(value))
+    }
+
+    #[test]
+    fn maps_modemmanager_network_availability_values() {
+        assert_eq!(operator_availability(0), "unknown");
+        assert_eq!(operator_availability(1), "available");
+        assert_eq!(operator_availability(2), "current");
+        assert_eq!(operator_availability(3), "forbidden");
+        assert_eq!(operator_availability(99), "unknown");
+    }
+
+    #[test]
+    fn parses_modemmanager_scan_rows() {
+        let row = HashMap::from([
+            ("status".to_string(), OwnedValue::from(1_u32)),
+            ("operator-long".to_string(), owned_string("Test Network")),
+            ("operator-code".to_string(), owned_string("310260")),
+            (
+                "access-technology".to_string(),
+                OwnedValue::from(1_u32 << 13),
+            ),
+        ]);
+
+        let parsed = parse_scanned_networks(vec![row]);
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "Test Network");
+        assert_eq!(parsed[0].status, "available");
+        assert_eq!(parsed[0].mcc, "310");
+        assert_eq!(parsed[0].mnc, "260");
+        assert_eq!(parsed[0].technologies, vec!["LTE"]);
+    }
+
+    #[test]
+    fn ignores_scan_rows_without_operator_code() {
+        let row = HashMap::from([
+            ("status".to_string(), OwnedValue::from(1_u32)),
+            ("operator-long".to_string(), owned_string("Unknown")),
+        ]);
+
+        assert!(parse_scanned_networks(vec![row]).is_empty());
+    }
+
     #[test]
     fn treats_only_data_attach_transitions_as_connection_in_progress() {
         assert!(!data_connection_transition_in_progress(
@@ -3601,6 +3668,15 @@ async fn modem_operator_code(conn: &Connection, modem_path: &str) -> String {
         })
 }
 
+async fn registered_operator_code(conn: &Connection, modem_path: &str) -> String {
+    get_all_properties(conn, modem_path, MM_MODEM_3GPP)
+        .await
+        .unwrap_or_default()
+        .get("OperatorCode")
+        .map(extract_string)
+        .unwrap_or_default()
+}
+
 async fn inferred_default_simple_connect_settings(
     conn: &Connection,
     modem_path: &str,
@@ -3735,6 +3811,19 @@ async fn set_data_connection_inner(
                 "Data connection activated via NetworkManager"
             );
         } else {
+            // 即使连接当前已经断开，也要同步 profile 的漫游策略。
+            // 启动时用户关闭数据的路径也会经过这里，不能只停用连接。
+            let connect_settings = if let Ok(modem_path) = find_modem_path(conn).await {
+                resolve_simple_connect_settings(conn, &modem_path, configured_apn).await
+            } else {
+                configured_apn
+                    .map(apn_config_to_simple_connect_settings)
+                    .unwrap_or_default()
+            };
+            nm_update_connection(&profile, &connect_settings, allow_roaming)
+                .await
+                .map_err(|err| zbus::fdo::Error::Failed(format!("NM 漫游策略更新失败: {err}")))?;
+
             // 通过 NM 停用连接
             if let Err(err) = nm_deactivate_connection(&profile).await {
                 // 如果已经断开，忽略错误
@@ -3815,8 +3904,23 @@ pub async fn apply_roaming_policy(
     config
         .set_roaming_allowed(allowed)
         .map_err(|e| zbus::fdo::Error::Failed(e))?;
+
+    let apn_config = config.get_apn_config();
+    let profile = find_nm_modem_connection().await;
+    if let Ok(profile) = profile {
+        // 更新 profile 本身，即使当前数据连接已断开。否则关闭数据时切换
+        // 漫游策略只会写入 config.json，NetworkManager 仍会保留旧配置。
+        let connect_settings = if let Ok(modem_path) = find_modem_path(conn).await {
+            resolve_simple_connect_settings(conn, &modem_path, Some(&apn_config)).await
+        } else {
+            apn_config_to_simple_connect_settings(&apn_config)
+        };
+        nm_update_connection(&profile, &connect_settings, allowed)
+            .await
+            .map_err(zbus::fdo::Error::Failed)?;
+    }
+
     if get_data_connection_status(conn).await.unwrap_or(false) {
-        let apn_config = config.get_apn_config();
         set_data_connection_with_apn(conn, false, allowed, Some(&apn_config)).await?;
         set_data_connection_with_apn(conn, true, allowed, Some(&apn_config)).await?;
     }
@@ -4132,6 +4236,53 @@ async fn recover_after_registration_failure(
     }
 }
 
+async fn restore_selection_after_registration_failure(
+    conn: &Connection,
+    modem_path: &str,
+    previous: OperatorSelectionState,
+    original_error: String,
+) -> Result<(), String> {
+    let restore_target = if previous.restore_mode == "auto" {
+        ""
+    } else {
+        previous.restore_operator.trim()
+    };
+    if previous.restore_mode == "manual" && restore_target.is_empty() {
+        return Err(format!(
+            "目标运营商注册失败：{original_error}；切换前未读取到原运营商，无法恢复手动选择"
+        ));
+    }
+
+    match register_operator_on_modem(conn, modem_path, restore_target).await {
+        Ok(()) => {
+            let restored_state = OperatorSelectionState {
+                mode: previous.restore_mode,
+                restore_mode: previous.restore_mode,
+                restore_operator: previous.restore_operator.clone(),
+            };
+            *OPERATOR_SELECTION_STATE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = restored_state;
+            let restored = if previous.restore_mode == "auto" {
+                "自动选择".to_string()
+            } else {
+                format!("原运营商 {restore_target}")
+            };
+            Err(format!(
+                "目标运营商注册失败：{original_error}；已恢复{restored}"
+            ))
+        }
+        Err(restore_error) => Err(format!(
+            "目标运营商注册失败：{original_error}；恢复{}也失败：{restore_error}",
+            if previous.restore_mode == "auto" {
+                "自动选择".to_string()
+            } else {
+                format!("原运营商 {restore_target}")
+            }
+        )),
+    }
+}
+
 pub async fn set_airplane_mode(conn: &Connection, enabled: bool) -> Result<(), String> {
     with_serial(async {
         let modem_path = find_modem_path(conn).await.map_err(|err| err.to_string())?;
@@ -4284,32 +4435,43 @@ pub async fn get_cell_location(conn: &Connection) -> zbus::Result<CellLocationRe
     })
 }
 
-fn parse_available_networks_value(value: &OwnedValue) -> Vec<OperatorInfo> {
-    let Ok(rows) = Vec::<HashMap<String, OwnedValue>>::try_from(value.clone()) else {
-        return Vec::new();
-    };
+fn operator_availability(value: u32) -> &'static str {
+    match value {
+        1 => "available",
+        2 => "current",
+        3 => "forbidden",
+        _ => "unknown",
+    }
+}
+
+fn parse_scanned_networks(rows: Vec<HashMap<String, OwnedValue>>) -> Vec<OperatorInfo> {
     let mut out = Vec::new();
     for (idx, row) in rows.into_iter().enumerate() {
         let op_id = row
-            .get("operator-id")
+            .get("operator-code")
             .map(extract_string)
             .unwrap_or_default();
         let (mcc, mnc) = split_operator_code(&op_id);
         let name = row
             .get("operator-long")
-            .or_else(|| row.get("operator-name"))
+            .or_else(|| row.get("operator-short"))
             .map(extract_string)
             .unwrap_or_else(|| op_id.clone());
         let name = localize_operator_display(&mcc, &mnc, &name);
         let status = row
             .get("status")
-            .map(extract_string)
+            .map(extract_u32)
+            .map(operator_availability)
+            .map(str::to_string)
             .unwrap_or_else(|| "available".into());
         let tech = row
             .get("access-technology")
             .map(extract_u32)
             .map(|v| mm_access_tech_to_string(v).to_uppercase())
             .unwrap_or_else(|| "LTE".to_string());
+        if op_id.is_empty() {
+            continue;
+        }
         out.push(OperatorInfo {
             path: format!("/scan/{idx}"),
             name,
@@ -4341,59 +4503,73 @@ pub async fn get_operators_list(conn: &Connection) -> zbus::Result<OperatorListR
         .map(mm_access_tech_to_string)
         .unwrap_or_else(|| "lte".to_string())
         .to_uppercase();
-    let current = OperatorInfo {
-        path: format!("{modem_path}/current"),
-        name: localize_operator_display(&mcc, &mnc, &op_name),
-        status: "current".into(),
-        mcc,
-        mnc,
-        technologies: vec![access],
-    };
-    let mut operators = vec![current];
-    if let Ok(v) = get_property(conn, &modem_path, MM_MODEM_3GPP, "AvailableNetworks").await {
-        let mut scanned = parse_available_networks_value(&v);
-        if !scanned.is_empty() {
-            scanned.retain(|o| o.status != "current");
-            operators.extend(scanned);
+    let mut operators = Vec::new();
+    if !oc.is_empty() || !op_name.is_empty() {
+        operators.push(OperatorInfo {
+            path: format!("{modem_path}/current"),
+            name: localize_operator_display(&mcc, &mnc, &op_name),
+            status: "current".into(),
+            mcc,
+            mnc,
+            technologies: vec![access],
+        });
+    }
+    let scanned = OPERATOR_SCAN_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    for operator in scanned {
+        if operator.status == "current" {
+            continue;
+        }
+        let duplicate = operators.iter().any(|current| {
+            !operator.mcc.is_empty() && current.mcc == operator.mcc && current.mnc == operator.mnc
+        });
+        if !duplicate {
+            operators.push(operator);
         }
     }
-    Ok(OperatorListResponse { operators })
+    let selection_mode = OPERATOR_SELECTION_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .mode
+        .to_string();
+    Ok(OperatorListResponse {
+        selection_mode,
+        operators,
+    })
 }
 
 pub async fn scan_operators(conn: &Connection) -> zbus::Result<OperatorListResponse> {
     let modem_path = find_modem_path(conn).await?;
+    let previous_operator = registered_operator_code(conn, &modem_path).await;
+    {
+        let mut state = OPERATOR_SELECTION_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.restore_mode = state.mode;
+        state.restore_operator = previous_operator;
+        state.mode = "manual";
+    }
     let proxy = Proxy::new(conn, MM_SERVICE, modem_path.as_str(), MM_MODEM_3GPP).await?;
-    match tokio::time::timeout(
+    let rows = match tokio::time::timeout(
         Duration::from_secs(OPERATOR_SCAN_REQUEST_TIMEOUT_SECS),
-        proxy.call::<_, _, ()>("Scan", &()),
+        proxy.call::<_, _, Vec<HashMap<String, OwnedValue>>>("Scan", &()),
     )
     .await
     {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => warn!(error = %err, "Operator scan request failed"),
-        Err(_) => warn!(
-            timeout_secs = OPERATOR_SCAN_REQUEST_TIMEOUT_SECS,
-            "Operator scan request timed out"
-        ),
-    }
-
-    let polls = OPERATOR_SCAN_CACHE_POLL_SECS / 2;
-    for _ in 0..polls {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        if let Ok(v) = get_property(conn, &modem_path, MM_MODEM_3GPP, "AvailableNetworks").await {
-            let parsed = parse_available_networks_value(&v);
-            if !parsed.is_empty() {
-                let mut base = get_operators_list(conn).await?.operators;
-                for o in parsed {
-                    let key = format!("{}-{}", o.mcc, o.mnc);
-                    if !base.iter().any(|b| format!("{}-{}", b.mcc, b.mnc) == key) {
-                        base.push(o);
-                    }
-                }
-                return Ok(OperatorListResponse { operators: base });
-            }
+        Ok(Ok(rows)) => rows,
+        Ok(Err(err)) => return Err(err),
+        Err(_) => {
+            return Err(zbus::Error::Failure(format!(
+                "Operator scan timed out after {OPERATOR_SCAN_REQUEST_TIMEOUT_SECS}s"
+            )))
         }
-    }
+    };
+    let parsed = parse_scanned_networks(rows);
+    *OPERATOR_SCAN_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = parsed;
     get_operators_list(conn).await
 }
 
@@ -4424,14 +4600,26 @@ async fn register_operator_on_modem(
 pub async fn register_operator_manual(conn: &Connection, mccmnc: &str) -> Result<(), String> {
     with_serial(async {
         let modem_path = find_modem_path(conn).await.map_err(|err| err.to_string())?;
+        let previous = OPERATOR_SELECTION_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         match register_operator_on_modem(conn, &modem_path, mccmnc).await {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                *OPERATOR_SELECTION_STATE
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = OperatorSelectionState {
+                    mode: "manual",
+                    restore_mode: "manual",
+                    restore_operator: mccmnc.to_string(),
+                };
+                Ok(())
+            }
             Err(err) => {
                 if is_qmi_network_selection_internal_error(&err) {
-                    recover_after_registration_failure(conn, &modem_path, err).await
-                } else {
-                    Err(err)
+                    recover_after_registration_failure(conn, &modem_path, err.clone()).await?;
                 }
+                restore_selection_after_registration_failure(conn, &modem_path, previous, err).await
             }
         }
     })
@@ -4441,6 +4629,14 @@ pub async fn register_operator_manual(conn: &Connection, mccmnc: &str) -> Result
 pub async fn register_operator_auto(conn: &Connection) -> Result<(), String> {
     with_serial(async {
         let modem_path = find_modem_path(conn).await.map_err(|err| err.to_string())?;
+        {
+            let mut state = OPERATOR_SELECTION_STATE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.mode = "auto";
+            state.restore_mode = "auto";
+            state.restore_operator.clear();
+        }
         match register_operator_on_modem(conn, &modem_path, "").await {
             Ok(()) => Ok(()),
             Err(err) => {

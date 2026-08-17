@@ -539,6 +539,7 @@ export interface OperatorInfo {
 }
 
 export interface OperatorListResponse {
+  selection_mode: 'auto' | 'manual'
   operators: OperatorInfo[]
 }
 

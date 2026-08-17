@@ -148,6 +148,7 @@ const MCC_COUNTRY: Record<string, string> = {
 
   // === 6xx: 非洲区域 ===
   '602': 'EG', // 埃及
+  '621': 'NG', // 尼日利亚
   '647': 'IO', // 英属印度洋领地
   '655': 'ZA', // 南非
 
@@ -242,8 +243,16 @@ function countryCodeFromIccid(iccid?: string | null) {
   return match?.[1] ?? null
 }
 
+function countryCodeFromProfileText(profile?: EsimProfile | null) {
+  const text = `${profile?.name ?? ''} ${profile?.provider ?? ''}`.toLowerCase()
+  if (/\bnigeria\b/.test(text)) return 'NG'
+  return null
+}
+
 function profileCountryCode(profile?: EsimProfile | null) {
-  return countryCodeFromMcc(profile?.mcc) ?? countryCodeFromIccid(profile?.iccid)
+  return countryCodeFromMcc(profile?.mcc)
+    ?? countryCodeFromProfileText(profile)
+    ?? countryCodeFromIccid(profile?.iccid)
 }
 
 function euiccManufacturerFromEid(eid?: string | null): string {
@@ -459,7 +468,8 @@ const FLAG_SVGS: Record<string, string> = {
   KR: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 60 40"><rect width="60" height="40" fill="#fff"/><path d="M30 10a10 10 0 0 1 0 20 5 5 0 0 1 0-10 5 5 0 0 0 0-10z" fill="#c60c30"/><path d="M30 30a10 10 0 0 1 0-20 5 5 0 0 1 0 10 5 5 0 0 0 0 10z" fill="#003478"/></svg>`,
   MO: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 60 40"><rect width="60" height="40" fill="#00785e"/><path d="M30 9 33 18h9l-7 5 3 8-8-5-8 5 3-8-7-5h9z" fill="#fff"/></svg>`,
   MX: verticalFlag(['#006847', '#fff', '#ce1126']),
-  MY: horizontalFlag(['#cc0001', '#fff', '#cc0001', '#fff', '#cc0001', '#fff', '#cc0001', '#fff']),
+  MY: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 60 40"><rect width="60" height="40" fill="#fff"/><path fill="#cc0001" d="M0 0h60v2.86H0zm0 5.72h60v2.86H0zm0 5.71h60v2.86H0zm0 5.72h60V20H0zm0 5.71h60v2.86H0zm0 5.72h60v2.86H0zm0 5.71h60V40H0z"/><rect width="30" height="22.86" fill="#010066"/><path d="M14.5 4.7a7 7 0 1 0 0 13.46 6 6 0 1 1 0-13.46z" fill="#ffcc00"/><polygon fill="#ffcc00" points="22,7 23.2,10.1 26.5,9.8 24.2,12.2 26.5,14.7 23.2,14.4 22,17.5 20.8,14.4 17.5,14.7 19.8,12.2 17.5,9.8 20.8,10.1"/></svg>`,
+  NG: verticalFlag(['#008753', '#fff', '#008753']),
   NL: horizontalFlag(['#ae1c28', '#fff', '#21468b']),
   NO: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 60 40"><rect width="60" height="40" fill="#ba0c2f"/><rect x="16" width="12" height="40" fill="#fff"/><rect y="14" width="60" height="12" fill="#fff"/><rect x="19" width="6" height="40" fill="#00205b"/><rect y="17" width="60" height="6" fill="#00205b"/></svg>`,
   NZ: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 60 40"><rect width="60" height="40" fill="#012169"/><path fill="#fff" d="M0 0h30v20H0z"/><path stroke="#012169" stroke-width="3" d="M0 0l30 20M30 0 0 20"/><path stroke="#c8102e" stroke-width="2" d="M0 0l30 20M30 0 0 20"/><path stroke="#012169" stroke-width="7" d="M15 0v20M0 10h30"/><path stroke="#c8102e" stroke-width="4" d="M15 0v20M0 10h30"/><circle cx="46" cy="15" r="3" fill="#cc142b"/></svg>`,

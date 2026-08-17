@@ -775,6 +775,7 @@ pub struct OperatorInfo {
 
 #[derive(Debug, Default, Serialize)]
 pub struct OperatorListResponse {
+    pub selection_mode: String,
     pub operators: Vec<OperatorInfo>,
 }
 
